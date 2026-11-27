@@ -1,6 +1,0 @@
-{
-  "name": "Moviesx",
-  "description": "Watch free movies, TV shows, and anime online in HD on Moviesx. Stream the latest films and series with no signup required.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
