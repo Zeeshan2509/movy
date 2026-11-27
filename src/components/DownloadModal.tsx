@@ -4,6 +4,7 @@ import {
   Download,
   FileText,
   Film,
+  FolderOpen,
   History,
   Loader2,
   Search,
@@ -53,6 +54,9 @@ export const DownloadModal: React.FC<DownloadModalProps> = ({
 }) => {
   const {
     downloads,
+    isNativeDownload,
+    saveDirectory,
+    browseSaveDirectory,
     startVideoDownload,
     startSubtitleDownload,
     cancelDownload,
@@ -294,6 +298,30 @@ export const DownloadModal: React.FC<DownloadModalProps> = ({
 
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-5">
+          {isNativeDownload && (
+            <div className="rounded-xl bg-[#181818] border border-white/[0.08] px-3.5 py-2.5 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[#8c8c8c]">
+                  Save Location
+                </p>
+                <p
+                  className="text-xs font-medium text-[#e5e5e5] truncate mt-0.5"
+                  title={saveDirectory || 'Resolving folder...'}
+                >
+                  {saveDirectory || 'Resolving default Downloads/Movy folder...'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void browseSaveDirectory()}
+                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-white/[0.08] hover:bg-white/[0.16] text-xs font-semibold text-white transition shrink-0"
+              >
+                <FolderOpen className="w-3.5 h-3.5" />
+                <span>Change</span>
+              </button>
+            </div>
+          )}
+
           {loading ? (
             <div className="py-10 flex flex-col items-center justify-center gap-3 text-xs text-[#b3b3b3]">
               <Loader2 className="w-6 h-6 animate-spin text-[#e50914]" />
@@ -391,7 +419,9 @@ export const DownloadModal: React.FC<DownloadModalProps> = ({
                                 />
                               </div>
                               <div className="flex items-center justify-between text-[11px] text-[#b3b3b3] tabular-nums">
-                                <span className="truncate">{matched.statusText}</span>
+                                <span className="truncate">
+                                  {matched.quality} · {matched.statusText}
+                                </span>
                                 <span>
                                   {matched.bytesDownloaded > 0
                                     ? `${formatDownloadBytes(matched.bytesDownloaded)} · ${matched.progress}%`

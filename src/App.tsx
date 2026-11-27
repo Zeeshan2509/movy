@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { ArrowLeft, Bookmark, Clock, Loader2, Trash2 } from 'lucide-react';
+import React, { Suspense, useEffect, useMemo, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import { ArrowLeft, ArrowUp, Bookmark, Clock, Loader2, Trash2 } from 'lucide-react';
 import { DownloadModal } from '@/src/components/DownloadModal';
 import { DownloadsModal } from '@/src/components/DownloadsModal';
 import { Header } from '@/src/components/Header';
@@ -8,7 +9,12 @@ import { HorizontalRail } from '@/src/components/HorizontalRail';
 import { MediaCard } from '@/src/components/MediaCard';
 import { TitleDetailView } from '@/src/components/TitleDetailView';
 import { Top10Showcase } from '@/src/components/Top10Showcase';
-import { VideoPlayerView } from '@/src/components/VideoPlayerView';
+
+const VideoPlayerView = React.lazy(() =>
+  import('@/src/components/VideoPlayerView').then((m) => ({
+    default: m.VideoPlayerView,
+  })),
+);
 import {
   BILLBOARD_IDS,
   CATALOG_ITEMS,
@@ -461,17 +467,27 @@ export default function App() {
     setPlayerContext(options);
   };
 
+  const [showScrollTop, setShowScrollTop] = useState(false);
+
+  useEffect(() => {
+    const onScroll = () => setShowScrollTop(window.scrollY > 600);
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  const isHeroPage = Boolean(selectedDetailItem) || (!activeGenre && activeTab === 'home');
+
   return (
     <div className="min-h-screen flex flex-col bg-[#0f0f0f] text-[#f2f2f2]">
       <Header
         activeTab={activeTab}
+        isHeroPage={isHeroPage}
         onSelectTab={handleSelectTab}
         searchOpen={searchOpen}
         onOpenSearch={() => setSearchOpen(true)}
         onCloseSearch={() => setSearchOpen(false)}
         watchlistCount={watchlistCount}
-        isInWatchlist={isInWatchlist}
-        onToggleWatchlist={toggleWatchlist}
         onPlayMedia={(item) => handleStartPlay({ item })}
         onSelectMedia={handleOpenDetail}
       />
@@ -1018,18 +1034,48 @@ export default function App() {
         </div>
       </footer>
 
+      {/* Movy Desktop ScrollToTop */}
+      <AnimatePresence>
+        {showScrollTop && !playerContext && (
+          <motion.button
+            type="button"
+            onClick={() => {
+              const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+              window.scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' });
+            }}
+            initial={{ opacity: 0, y: 10, scale: 0.94 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 8, scale: 0.96 }}
+            transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+            style={{ willChange: 'transform, opacity' }}
+            className="mv-icon-btn fixed right-6 bottom-[calc(env(safe-area-inset-bottom)+24px)] z-40 hidden md:inline-flex"
+            aria-label="Scroll to top"
+          >
+            <ArrowUp size={20} strokeWidth={2} />
+          </motion.button>
+        )}
+      </AnimatePresence>
+
       {/* Cinema Video Player (Real Full Movies / Episodes) */}
       {playerContext && (
-        <VideoPlayerView
-          item={playerContext.item}
-          initialSeason={playerContext.seasonNumber}
-          initialEpisode={playerContext.episode}
-          initialAnimeAudio={playerContext.animeAudio}
-          inWatchlist={isInWatchlist(playerContext.item.id)}
-          onToggleWatchlist={toggleWatchlist}
-          onOpenDownload={(ctx) => setDownloadContext(ctx)}
-          onClose={() => setPlayerContext(null)}
-        />
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black text-white">
+              <Loader2 className="w-8 h-8 animate-spin text-white/80" />
+            </div>
+          }
+        >
+          <VideoPlayerView
+            item={playerContext.item}
+            initialSeason={playerContext.seasonNumber}
+            initialEpisode={playerContext.episode}
+            initialAnimeAudio={playerContext.animeAudio}
+            inWatchlist={isInWatchlist(playerContext.item.id)}
+            onToggleWatchlist={toggleWatchlist}
+            onOpenDownload={(ctx) => setDownloadContext(ctx)}
+            onClose={() => setPlayerContext(null)}
+          />
+        </Suspense>
       )}
 
       {/* Download Modal */}

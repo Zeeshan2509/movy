@@ -43,6 +43,16 @@
       content="Watch free movies, TV shows, and anime online in HD on Moviesx. Ad-free streaming with no signup required."
     />
     <meta name="theme-color" content="#0f0f0f" />
+    <style>
+      html,
+      body {
+        background-color: #0f0f0f;
+        color: #f2f2f2;
+        margin: 0;
+        overscroll-behavior: none;
+        overscroll-behavior-y: none;
+      }
+    </style>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
@@ -51,7 +61,15 @@
     <link
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
     />
+    <noscript>
+      <link
+        href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
+        rel="stylesheet"
+      />
+    </noscript>
   </head>
   <body class="bg-[#0f0f0f] text-[#f2f2f2] antialiased selection:bg-[#e50914]/30 selection:text-white">
     <div id="root"></div>

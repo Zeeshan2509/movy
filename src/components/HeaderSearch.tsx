@@ -1,8 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { AnimatePresence, motion } from 'motion/react';
 import {
-  Bookmark,
-  Check,
   ChevronDown,
   Film,
   Loader2,
@@ -16,13 +15,14 @@ import type { MediaItem, MediaType } from '@/src/types/media';
 type FilterScope = 'all' | MediaType;
 
 const SEARCH_HISTORY_KEY = 'app_search_history';
+const ACCORDION_TRANSITION = { duration: 0.24, ease: [0.22, 1, 0.36, 1] as const };
 
 function readSearchHistory(): string[] {
   try {
     const raw = localStorage.getItem(SEARCH_HISTORY_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((s) => typeof s === 'string') : [];
+    return Array.isArray(parsed) ? parsed.filter((s) => typeof s === 'string').slice(0, 3) : [];
   } catch {
     return [];
   }
@@ -32,7 +32,7 @@ function saveSearchTerm(term: string): string[] {
   const clean = term.trim();
   if (!clean) return readSearchHistory();
   try {
-    const next = [clean, ...readSearchHistory().filter((s) => s !== clean)].slice(0, 4);
+    const next = [clean, ...readSearchHistory().filter((s) => s !== clean)].slice(0, 3);
     localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next));
     return next;
   } catch {
@@ -42,8 +42,6 @@ function saveSearchTerm(term: string): string[] {
 
 interface SearchResultRowProps {
   item: MediaItem;
-  saved: boolean;
-  onToggleWatchlist: (item: MediaItem) => void;
   onPlay: (item: MediaItem) => void;
   onSelect: (item: MediaItem) => void;
   onClose: () => void;
@@ -51,8 +49,6 @@ interface SearchResultRowProps {
 
 const SearchResultRow: React.FC<SearchResultRowProps> = ({
   item,
-  saved,
-  onToggleWatchlist,
   onPlay,
   onSelect,
   onClose,
@@ -139,53 +135,48 @@ const SearchResultRow: React.FC<SearchResultRowProps> = ({
         />
       </button>
 
-      {expanded && (
-        <div className="px-2.5 pb-2.5 pt-0.5">
-          {item.description && (
-            <p className="mb-3 text-[12px] leading-relaxed text-[#b3b3b3] line-clamp-3">
-              {item.description}
-            </p>
-          )}
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                onClose();
-                onPlay(item);
-              }}
-              className="mv-btn mv-btn--primary mv-btn--sm !h-8 !px-3"
-            >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              <span>Play</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                onClose();
-                onSelect(item);
-              }}
-              className="mv-btn mv-btn--secondary mv-btn--sm !h-8 !px-3"
-            >
-              <span>See more</span>
-            </button>
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggleWatchlist(item);
-              }}
-              aria-label={saved ? 'Remove from Watchlist' : 'Add to Watchlist'}
-              className={`ml-auto inline-flex items-center justify-center h-8 w-8 rounded-[8px] border transition ${
-                saved
-                  ? 'bg-white/15 border-white/30 text-white'
-                  : 'bg-white/[0.04] border-white/10 text-[#b3b3b3] hover:text-white hover:bg-white/10'
-              }`}
-            >
-              {saved ? <Check className="w-3.5 h-3.5" /> : <Bookmark className="w-3.5 h-3.5" />}
-            </button>
-          </div>
-        </div>
-      )}
+      <AnimatePresence initial={false}>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={ACCORDION_TRANSITION}
+            className="overflow-hidden"
+          >
+            <div className="px-2.5 pb-2.5 pt-0.5">
+              {item.description && (
+                <p className="mb-3 text-[12px] leading-relaxed text-[#b3b3b3] line-clamp-3">
+                  {item.description}
+                </p>
+              )}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onPlay(item);
+                  }}
+                  className="mv-btn mv-btn--primary mv-btn--sm !h-8 !px-3"
+                >
+                  <Play className="w-3.5 h-3.5 fill-current" />
+                  <span>Play</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onSelect(item);
+                  }}
+                  className="mv-btn mv-btn--secondary mv-btn--sm !h-8 !px-3"
+                >
+                  <span>See more</span>
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
@@ -193,10 +184,9 @@ const SearchResultRow: React.FC<SearchResultRowProps> = ({
 interface HeaderSearchProps {
   onClose: () => void;
   panelHostRef: React.RefObject<HTMLElement | null>;
+  panelVisible?: boolean;
   panelPlacement?: 'below' | 'above';
   autoFocusDelay?: number;
-  isInWatchlist: (id: number | string) => boolean;
-  onToggleWatchlist: (item: MediaItem) => void;
   onPlay: (item: MediaItem) => void;
   onSelect: (item: MediaItem) => void;
 }
@@ -211,15 +201,15 @@ const SCOPE_TABS: { value: FilterScope; label: string }[] = [
 export const HeaderSearch: React.FC<HeaderSearchProps> = ({
   onClose,
   panelHostRef,
+  panelVisible = true,
   panelPlacement = 'below',
   autoFocusDelay = 60,
-  isInWatchlist,
-  onToggleWatchlist,
   onPlay,
   onSelect,
 }) => {
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
 
   const [query, setQuery] = useState('');
@@ -227,6 +217,7 @@ export const HeaderSearch: React.FC<HeaderSearchProps> = ({
   const [scope, setScope] = useState<FilterScope>('all');
   const [recentSearches, setRecentSearches] = useState<string[]>(() => readSearchHistory());
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
+  const [panelHeight, setPanelHeight] = useState(0);
 
   const [results, setResults] = useState<MediaItem[]>([]);
   const [page, setPage] = useState(1);
@@ -374,12 +365,32 @@ export const HeaderSearch: React.FC<HeaderSearchProps> = ({
   const hasQuery = Boolean(debouncedQuery);
   const showRecent = !hasQuery && !query.trim() && recentSearches.length > 0;
   const panelOpen = useMemo(
-    () => showRecent || query.trim().length > 0,
-    [showRecent, query],
+    () => panelVisible && (showRecent || query.trim().length > 0),
+    [panelVisible, showRecent, query],
   );
 
   const isTypingDebounce = query.trim().length > 0 && query.trim() !== debouncedQuery;
   const showInitialSpinner = (loading || isTypingDebounce) && !loadingMore;
+
+  // Original Movy ResizeObserver height measurement for smooth dropdown reveal
+  useEffect(() => {
+    if (!panelOpen) {
+      setPanelHeight(0);
+      return;
+    }
+    const contentEl = contentRef.current;
+    if (!contentEl) return;
+
+    const measure = () => {
+      const cap = Math.min(0.7 * window.innerHeight, 440);
+      setPanelHeight(Math.min(contentEl.scrollHeight, cap));
+    };
+
+    const ro = new ResizeObserver(measure);
+    ro.observe(contentEl);
+    measure();
+    return () => ro.disconnect();
+  }, [panelOpen, results.length, recentSearches.length, hasQuery, showInitialSpinner, scope]);
 
   return (
     <>
@@ -388,123 +399,131 @@ export const HeaderSearch: React.FC<HeaderSearchProps> = ({
         type="text"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
-        placeholder="Search movies, shows, anime..."
+        placeholder="Search movies, shows, and anime"
         aria-label="Search"
         className="w-full h-10 bg-transparent text-[16px] md:text-[13px] text-white placeholder:text-[#8c8c8c] outline-none"
       />
 
       {portalTarget &&
-        panelOpen &&
         createPortal(
-          <div
-            className={`absolute ${
-              panelPlacement === 'above'
-                ? 'bottom-[calc(100%+10px)]'
-                : 'top-[calc(100%+8px)]'
-            } left-0 right-0 z-50 mv-panel overflow-hidden`}
-          >
-            <div
-              ref={scrollRef}
-              className="max-h-[min(70vh,440px)] overflow-y-auto overflow-x-hidden scrollbar-styles"
-            >
-              {/* Scope Filter Pills */}
-              <div className="flex items-center gap-1 px-2 pt-2 pb-1">
-                {SCOPE_TABS.map((tab) => {
-                  const active = scope === tab.value;
-                  return (
-                    <button
-                      key={tab.value}
-                      type="button"
-                      onClick={() => setScope(tab.value)}
-                      aria-pressed={active}
-                      className={
-                        active
-                          ? 'h-7 px-2.5 rounded-[6px] text-[12px] font-semibold text-white bg-[#353535] whitespace-nowrap'
-                          : 'h-7 px-2.5 rounded-[6px] text-[12px] font-medium text-[#b3b3b3] hover:text-white hover:bg-white/[0.06] transition-colors whitespace-nowrap'
-                      }
-                    >
-                      {tab.label}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div className="p-1.5 pt-0.5">
-                {showRecent && (
-                  <div className="px-1.5 pt-1.5 pb-1">
-                    <div className="flex items-center justify-between px-1.5 mb-1">
-                      <span className="text-[12px] font-semibold text-[#8c8c8c]">
-                        Recent searches
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          try {
-                            localStorage.removeItem(SEARCH_HISTORY_KEY);
-                          } catch {
-                            // Ignore
-                          }
-                          setRecentSearches([]);
-                        }}
-                        className="text-[12px] text-[#8c8c8c] hover:text-white transition-colors"
-                      >
-                        Clear history
-                      </button>
+          <AnimatePresence>
+            {panelOpen && (
+              <motion.div
+                key="search-panel"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: panelHeight || 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={ACCORDION_TRANSITION}
+                className={`absolute ${
+                  panelPlacement === 'above'
+                    ? 'bottom-[calc(100%+10px)]'
+                    : 'top-[calc(100%+8px)]'
+                } left-0 right-0 z-50 mv-panel overflow-hidden`}
+              >
+                <div
+                  ref={scrollRef}
+                  className="max-h-[min(70vh,440px)] overflow-y-auto overflow-x-hidden scrollbar-styles"
+                >
+                  <div ref={contentRef}>
+                    {/* Scope Filter Pills */}
+                    <div className="flex items-center gap-1 px-2 pt-2 pb-1">
+                      {SCOPE_TABS.map((tab) => {
+                        const active = scope === tab.value;
+                        return (
+                          <button
+                            key={tab.value}
+                            type="button"
+                            onClick={() => setScope(tab.value)}
+                            aria-pressed={active}
+                            className={
+                              active
+                                ? 'h-7 px-2.5 rounded-[6px] text-[12px] font-semibold text-white bg-[#353535] whitespace-nowrap'
+                                : 'h-7 px-2.5 rounded-[6px] text-[12px] font-medium text-[#b3b3b3] hover:text-white hover:bg-white/[0.06] transition-colors whitespace-nowrap'
+                            }
+                          >
+                            {tab.label}
+                          </button>
+                        );
+                      })}
                     </div>
-                    {recentSearches.map((term) => (
-                      <button
-                        key={term}
-                        type="button"
-                        onClick={() => setQuery(term)}
-                        className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[8px] text-left text-[13px] text-[#b3b3b3] hover:text-white hover:bg-white/[0.05] transition-colors"
-                      >
-                        {term}
-                      </button>
-                    ))}
-                  </div>
-                )}
 
-                {query.trim().length > 0 && (
-                  <>
-                    {results.length > 0 && !showInitialSpinner ? (
-                      <div className="flex flex-col">
-                        {results.map((item, idx) => (
-                          <SearchResultRow
-                            key={`${item.mediaType}-${item.id}-${idx}`}
-                            item={item}
-                            saved={isInWatchlist(item.id)}
-                            onToggleWatchlist={onToggleWatchlist}
-                            onPlay={onPlay}
-                            onSelect={onSelect}
-                            onClose={onClose}
-                          />
-                        ))}
-                        <div ref={sentinelRef} className="h-1" />
-                        {loadingMore && (
-                          <div className="flex justify-center py-3">
-                            <Loader2 className="w-[18px] h-[18px] animate-spin text-white/70" />
+                    <div className="p-1.5 pt-0.5">
+                      {showRecent && (
+                        <div className="px-1.5 pt-1.5 pb-1">
+                          <div className="flex items-center justify-between px-1.5 mb-1">
+                            <span className="text-[12px] font-semibold text-[#8c8c8c]">
+                              Recent searches
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                try {
+                                  localStorage.removeItem(SEARCH_HISTORY_KEY);
+                                } catch {
+                                  // Ignore
+                                }
+                                setRecentSearches([]);
+                              }}
+                              className="text-[12px] text-[#8c8c8c] hover:text-white transition-colors"
+                            >
+                              Clear history
+                            </button>
                           </div>
-                        )}
-                      </div>
-                    ) : showInitialSpinner ? (
-                      <div className="flex justify-center py-8">
-                        <Loader2 className="w-[22px] h-[22px] animate-spin text-white/70" />
-                      </div>
-                    ) : (
-                      <div className="flex flex-col items-center gap-3 py-8">
-                        <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-[#8c8c8c]">
-                          <Search className="w-5 h-5" />
+                          {recentSearches.map((term) => (
+                            <button
+                              key={term}
+                              type="button"
+                              onClick={() => setQuery(term)}
+                              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[8px] text-left text-[13px] text-[#b3b3b3] hover:text-white hover:bg-white/[0.05] transition-colors"
+                            >
+                              {term}
+                            </button>
+                          ))}
                         </div>
-                        <p className="text-[13px] text-[#8c8c8c] text-center">
-                          No results found
-                        </p>
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            </div>
-          </div>,
+                      )}
+
+                      {query.trim().length > 0 && (
+                        <>
+                          {results.length > 0 && !showInitialSpinner ? (
+                            <div className="flex flex-col">
+                              {results.map((item, idx) => (
+                                <SearchResultRow
+                                  key={`${item.mediaType}-${item.id}-${idx}`}
+                                  item={item}
+                                  onPlay={onPlay}
+                                  onSelect={onSelect}
+                                  onClose={onClose}
+                                />
+                              ))}
+                              <div ref={sentinelRef} className="h-1" />
+                              {loadingMore && (
+                                <div className="flex justify-center py-3">
+                                  <Loader2 className="w-[18px] h-[18px] animate-spin text-white/70" />
+                                </div>
+                              )}
+                            </div>
+                          ) : showInitialSpinner ? (
+                            <div className="flex justify-center py-8">
+                              <Loader2 className="w-[22px] h-[22px] animate-spin text-white/70" />
+                            </div>
+                          ) : (
+                            <div className="flex flex-col items-center gap-3 py-8">
+                              <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-[#8c8c8c]">
+                                <Search className="w-5 h-5" />
+                              </div>
+                              <p className="text-[13px] text-[#8c8c8c] text-center">
+                                No results found
+                              </p>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>,
           portalTarget,
         )}
     </>

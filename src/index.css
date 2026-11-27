@@ -35,8 +35,11 @@
     color: var(--ink-100);
     font-family: var(--font-body);
     color-scheme: dark;
-    scroll-behavior: smooth;
+    overscroll-behavior: none;
+    overscroll-behavior-y: none;
     -webkit-tap-highlight-color: transparent;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
   }
 
   body {
@@ -45,6 +48,38 @@
     background-color: var(--ink-950);
     color: var(--ink-100);
     overflow-x: hidden;
+    overscroll-behavior: none;
+    overscroll-behavior-y: none;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 9999px;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.36);
+  }
+
+  *::-webkit-scrollbar-corner,
+  *::-webkit-scrollbar-button {
+    width: 0;
+    height: 0;
+    display: none;
   }
 
   h1, h2, h3, h4, .font-display {
@@ -342,6 +377,254 @@
   width: 0;
   height: 0;
   display: none;
+}
+
+/* Original Movy ScrollRow (horizontal rail with drag inertia, sentinels, and edge fades) */
+.mv-scroll-row {
+  --row-gap: 6px;
+  --row-inset: 0px;
+  position: relative;
+}
+
+.mv-scroll-row.mv-scroll-bleed {
+  --row-inset: 16px;
+}
+
+@media (min-width: 768px) {
+  .mv-scroll-row {
+    --row-gap: 8px;
+  }
+  .mv-scroll-row.mv-scroll-bleed {
+    --row-inset: 24px;
+  }
+}
+
+.mv-scroll-track {
+  display: flex;
+  align-items: stretch;
+  gap: var(--row-gap);
+  padding-inline: var(--row-inset);
+  margin-inline: calc(var(--row-inset) * -1);
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: auto;
+  touch-action: pan-x pan-y;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.mv-scroll-track::-webkit-scrollbar {
+  display: none;
+}
+
+.mv-scroll-track:focus {
+  outline: none;
+}
+
+.mv-scroll-track:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: -2px;
+  border-radius: 10px;
+}
+
+.mv-scroll-track > :not(.mv-scroll-sentinel) {
+  flex: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .mv-scroll-track {
+    cursor: grab;
+  }
+  .mv-scroll-track[data-dragging="true"] {
+    cursor: grabbing;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .mv-scroll-track[data-dragging="true"] > :not(.mv-scroll-sentinel) {
+    pointer-events: none;
+  }
+}
+
+.mv-scroll-track img {
+  -webkit-user-drag: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.mv-scroll-sentinel {
+  visibility: hidden;
+  pointer-events: none;
+  flex: 0 0 1px;
+  align-self: stretch;
+  width: 1px;
+}
+
+.mv-scroll-sentinel-start {
+  margin-inline-end: calc(-1px - var(--row-gap));
+}
+
+.mv-scroll-sentinel-end {
+  margin-inline-start: calc(-1px - var(--row-gap));
+}
+
+.mv-scroll-row::before,
+.mv-scroll-row::after {
+  content: "";
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    var(--row-fade-dir, to left),
+    var(--ink-950) 0%,
+    rgba(15, 15, 15, 0.88) 30%,
+    rgba(15, 15, 15, 0.5) 60%,
+    transparent 100%
+  );
+  width: max(3.5rem, min(11vw, 9rem));
+  transition: opacity 0.28s;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.mv-scroll-row::before {
+  left: calc(var(--row-inset) * -1);
+  --row-fade-dir: to right;
+}
+
+.mv-scroll-row::after {
+  right: calc(var(--row-inset) * -1);
+  --row-fade-dir: to left;
+}
+
+.mv-scroll-row[data-at-start="false"]::before,
+.mv-scroll-row[data-at-end="false"]::after {
+  opacity: 1;
+}
+
+.mv-scroll-arrow {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 48px;
+  z-index: 3;
+  color: #fff;
+  opacity: 0;
+  transition: opacity 0.2s, transform 0.15s;
+}
+
+@media (min-width: 768px) {
+  .mv-scroll-arrow {
+    display: flex;
+  }
+}
+
+.mv-scroll-arrow-prev {
+  left: calc(var(--row-inset) * -1);
+}
+
+.mv-scroll-arrow-next {
+  right: calc(var(--row-inset) * -1);
+}
+
+.mv-scroll-row:hover .mv-scroll-arrow:not(:disabled) {
+  opacity: 1;
+}
+
+.mv-scroll-arrow:hover:not(:disabled) {
+  transform: scale(1.1);
+}
+
+.mv-scroll-arrow:disabled {
+  pointer-events: none;
+  opacity: 0 !important;
+}
+
+/* Original Movy sliding marker & dock panel */
+.mv-dock-panel {
+  background: rgba(24, 24, 24, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 9999px;
+  box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85);
+  align-items: center;
+  width: fit-content;
+  padding: 3px;
+  display: flex;
+  position: relative;
+}
+
+.mv-dock-surface {
+  background: rgba(24, 24, 24, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 9999px;
+  box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85);
+}
+
+.mv-dock-marker {
+  background: var(--ink-700);
+  pointer-events: none;
+  border-radius: 9999px;
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 0;
+}
+
+.mv-dock-item {
+  width: 44px;
+  height: 44px;
+  color: var(--ink-300);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  border-radius: 9999px;
+  outline: none;
+  flex-shrink: 0;
+  justify-content: center;
+  align-items: center;
+  transition: color 0.18s, transform 0.12s;
+  display: inline-flex;
+  position: relative;
+  z-index: 1;
+}
+
+.mv-dock-item:active {
+  transform: scale(0.92);
+}
+
+.mv-dock-item:hover {
+  color: #fff;
+}
+
+.mv-dock-item.is-active {
+  color: #fff;
+}
+
+.mv-dock-divider {
+  background: rgba(255, 255, 255, 0.1);
+  flex-shrink: 0;
+  width: 1px;
+  height: 20px;
+  margin-inline: 6px;
+}
+
+/* Accordion smooth open animation for mobile episodes */
+@keyframes mvAccordionIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mv-accordion-in {
+  animation: mvAccordionIn 0.2s var(--ease-out) both;
 }
 
 /* Movy Native Video Player CSS */

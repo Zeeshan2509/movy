@@ -8,12 +8,18 @@ import React, {
   useState,
 } from 'react';
 import {
+  cancelTauriDownload,
   downloadDirectVideoOrHls,
   downloadSubtitleFile,
+  downloadViaTauriToDisk,
+  getDefaultDownloadDir,
+  isTauriRuntime,
+  pickDownloadFolder,
 } from '@/src/services/streamResolver';
 import type { DownloadRecord, MediaItem, SubtitleTrack } from '@/src/types/media';
 
 const STORAGE_KEY = 'moviesx_downloads_v1';
+const SAVE_DIR_STORAGE_KEY = 'moviesx_download_dir_v1';
 const MAX_DOWNLOAD_RECORDS = 60;
 
 interface StartVideoDownloadInput {
@@ -38,6 +44,10 @@ interface DownloadContextValue {
   overallProgress: number;
   downloadsOpen: boolean;
   setDownloadsOpen: (open: boolean) => void;
+  isNativeDownload: boolean;
+  saveDirectory: string;
+  browseSaveDirectory: () => Promise<string | null>;
+  resetSaveDirectory: () => Promise<string>;
   startVideoDownload: (input: StartVideoDownloadInput) => string;
   startSubtitleDownload: (input: StartSubtitleDownloadInput) => Promise<void>;
   cancelDownload: (id: string) => void;
@@ -47,6 +57,32 @@ interface DownloadContextValue {
 }
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
+
+function sanitizeSaveDir(dir: string | null | undefined): string {
+  const trimmed = (dir || '').trim();
+  if (!trimmed || /%userprofile%/i.test(trimmed)) return '';
+  return trimmed.replace(/\\/g, '/');
+}
+
+function readStoredSaveDir(): string {
+  try {
+    return sanitizeSaveDir(window.localStorage.getItem(SAVE_DIR_STORAGE_KEY));
+  } catch {
+    return '';
+  }
+}
+
+function writeStoredSaveDir(dir: string): void {
+  try {
+    if (dir) {
+      window.localStorage.setItem(SAVE_DIR_STORAGE_KEY, dir);
+    } else {
+      window.localStorage.removeItem(SAVE_DIR_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 function readStoredDownloads(): DownloadRecord[] {
   try {
@@ -86,13 +122,54 @@ function writeStoredDownloads(records: DownloadRecord[]): void {
 }
 
 export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const isNativeDownload = isTauriRuntime();
   const [downloads, setDownloads] = useState<DownloadRecord[]>(() => readStoredDownloads());
   const [downloadsOpen, setDownloadsOpen] = useState(false);
+  const [saveDirectory, setSaveDirectory] = useState<string>(() => readStoredSaveDir());
   const controllersRef = useRef<Map<string, AbortController>>(new Map());
+  const saveDirRef = useRef(saveDirectory);
+
+  useEffect(() => {
+    saveDirRef.current = saveDirectory;
+    writeStoredSaveDir(saveDirectory);
+  }, [saveDirectory]);
+
+  // Resolve real OS user Downloads/Movy path in Tauri (never literal %userprofile%)
+  useEffect(() => {
+    if (!isNativeDownload) return;
+    if (saveDirectory && !/%userprofile%/i.test(saveDirectory)) return;
+    let cancelled = false;
+    getDefaultDownloadDir().then((dir) => {
+      if (!cancelled && dir) {
+        setSaveDirectory(dir);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isNativeDownload, saveDirectory]);
 
   useEffect(() => {
     writeStoredDownloads(downloads);
   }, [downloads]);
+
+  const browseSaveDirectory = useCallback(async () => {
+    if (!isNativeDownload) return null;
+    const current = saveDirRef.current || (await getDefaultDownloadDir());
+    const chosen = await pickDownloadFolder(current);
+    if (chosen) {
+      setSaveDirectory(chosen);
+      return chosen;
+    }
+    return null;
+  }, [isNativeDownload]);
+
+  const resetSaveDirectory = useCallback(async () => {
+    if (!isNativeDownload) return '';
+    const def = await getDefaultDownloadDir();
+    if (def) setSaveDirectory(def);
+    return def;
+  }, [isNativeDownload]);
 
   const updateRecord = useCallback((id: string, patch: Partial<DownloadRecord>) => {
     setDownloads((prev) =>
@@ -102,6 +179,54 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const executeVideoTransfer = useCallback(
     (id: string, url: string, filename: string) => {
+      if (isNativeDownload) {
+        void (async () => {
+          try {
+            const targetDir = saveDirRef.current || (await getDefaultDownloadDir());
+            if (targetDir && !saveDirRef.current) {
+              setSaveDirectory(targetDir);
+            }
+            const res = await downloadViaTauriToDisk({
+              downloadId: id,
+              url,
+              saveDir: targetDir,
+              filename,
+              onProgress: (payload) => {
+                updateRecord(id, {
+                  progress: payload.percent,
+                  statusText: payload.label,
+                  bytesDownloaded: payload.bytesDownloaded,
+                  totalBytes: payload.totalBytes,
+                });
+              },
+            });
+            updateRecord(id, {
+              status: 'completed',
+              progress: 100,
+              statusText: res.fullPath ? `Saved to ${res.fullPath}` : 'Saved to device',
+              bytesDownloaded: res.bytesDownloaded,
+              filename: res.finalFilename,
+              savePath: res.fullPath,
+              completedAt: Date.now(),
+            });
+          } catch (err) {
+            const msg = typeof err === 'string' ? err : (err as Error)?.message || '';
+            if (msg.toLowerCase().includes('cancelled')) {
+              updateRecord(id, {
+                status: 'cancelled',
+                statusText: 'Cancelled',
+              });
+            } else {
+              updateRecord(id, {
+                status: 'failed',
+                statusText: msg || 'Download failed — tap Retry',
+              });
+            }
+          }
+        })();
+        return;
+      }
+
       controllersRef.current.get(id)?.abort();
       const controller = new AbortController();
       controllersRef.current.set(id, controller);
@@ -147,7 +272,7 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           controllersRef.current.delete(id);
         });
     },
-    [updateRecord],
+    [isNativeDownload, updateRecord],
   );
 
   const startVideoDownload = useCallback(
@@ -168,6 +293,7 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         statusText: 'Starting download...',
         bytesDownloaded: 0,
         totalBytes: null,
+        savePath: saveDirRef.current ? `${saveDirRef.current}/${input.filename}` : null,
         createdAt: Date.now(),
       };
 
@@ -196,11 +322,32 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         statusText: 'Saving subtitle...',
         bytesDownloaded: 0,
         totalBytes: null,
+        savePath: saveDirRef.current ? `${saveDirRef.current}/${input.filename}` : null,
         createdAt: Date.now(),
       };
       setDownloads((prev) => [record, ...prev].slice(0, MAX_DOWNLOAD_RECORDS));
 
       try {
+        if (isNativeDownload) {
+          const targetDir = saveDirRef.current || (await getDefaultDownloadDir());
+          const res = await downloadViaTauriToDisk({
+            downloadId: id,
+            url: input.subtitle.url,
+            saveDir: targetDir,
+            filename: input.filename,
+          });
+          updateRecord(id, {
+            status: 'completed',
+            progress: 100,
+            statusText: res.fullPath ? `Saved to ${res.fullPath}` : 'Saved subtitle',
+            bytesDownloaded: res.bytesDownloaded,
+            filename: res.finalFilename,
+            savePath: res.fullPath,
+            completedAt: Date.now(),
+          });
+          return;
+        }
+
         const { bytesDownloaded, finalFilename } = await downloadSubtitleFile({
           url: input.subtitle.url,
           filename: input.filename,
@@ -220,23 +367,29 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         });
       }
     },
-    [updateRecord],
+    [isNativeDownload, updateRecord],
   );
 
-  const cancelDownload = useCallback((id: string) => {
-    const controller = controllersRef.current.get(id);
-    if (controller) {
-      controller.abort();
-      controllersRef.current.delete(id);
-    }
-    setDownloads((prev) =>
-      prev.map((rec) =>
-        rec.id === id
-          ? { ...rec, status: 'cancelled', statusText: 'Cancelled' }
-          : rec,
-      ),
-    );
-  }, []);
+  const cancelDownload = useCallback(
+    (id: string) => {
+      if (isNativeDownload) {
+        void cancelTauriDownload(id);
+      }
+      const controller = controllersRef.current.get(id);
+      if (controller) {
+        controller.abort();
+        controllersRef.current.delete(id);
+      }
+      setDownloads((prev) =>
+        prev.map((rec) =>
+          rec.id === id
+            ? { ...rec, status: 'cancelled', statusText: 'Cancelled' }
+            : rec,
+        ),
+      );
+    },
+    [isNativeDownload],
+  );
 
   const retryDownload = useCallback(
     (record: DownloadRecord) => {
@@ -246,13 +399,29 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           progress: 40,
           statusText: 'Retrying subtitle...',
         });
-        downloadSubtitleFile({ url: record.url, filename: record.filename })
-          .then(({ bytesDownloaded }) => {
+        const retrySub = async () => {
+          if (isNativeDownload) {
+            const targetDir = saveDirRef.current || (await getDefaultDownloadDir());
+            return downloadViaTauriToDisk({
+              downloadId: record.id,
+              url: record.url,
+              saveDir: targetDir,
+              filename: record.filename,
+            });
+          }
+          return downloadSubtitleFile({ url: record.url, filename: record.filename });
+        };
+
+        retrySub()
+          .then((res) => {
+            const fullPath =
+              'fullPath' in res && typeof res.fullPath === 'string' ? res.fullPath : null;
             updateRecord(record.id, {
               status: 'completed',
               progress: 100,
-              statusText: 'Saved subtitle',
-              bytesDownloaded,
+              statusText: fullPath ? `Saved to ${fullPath}` : 'Saved subtitle',
+              bytesDownloaded: res.bytesDownloaded,
+              savePath: fullPath,
               completedAt: Date.now(),
             });
           })
@@ -273,14 +442,20 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       });
       executeVideoTransfer(record.id, record.url, record.filename);
     },
-    [executeVideoTransfer, updateRecord],
+    [executeVideoTransfer, isNativeDownload, updateRecord],
   );
 
-  const removeDownload = useCallback((id: string) => {
-    controllersRef.current.get(id)?.abort();
-    controllersRef.current.delete(id);
-    setDownloads((prev) => prev.filter((rec) => rec.id !== id));
-  }, []);
+  const removeDownload = useCallback(
+    (id: string) => {
+      if (isNativeDownload) {
+        void cancelTauriDownload(id);
+      }
+      controllersRef.current.get(id)?.abort();
+      controllersRef.current.delete(id);
+      setDownloads((prev) => prev.filter((rec) => rec.id !== id));
+    },
+    [isNativeDownload],
+  );
 
   const clearHistory = useCallback(() => {
     setDownloads((prev) => prev.filter((rec) => rec.status === 'downloading'));
@@ -310,6 +485,10 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       overallProgress,
       downloadsOpen,
       setDownloadsOpen,
+      isNativeDownload,
+      saveDirectory,
+      browseSaveDirectory,
+      resetSaveDirectory,
       startVideoDownload,
       startSubtitleDownload,
       cancelDownload,
@@ -323,6 +502,10 @@ export const DownloadProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       historyDownloads,
       overallProgress,
       downloadsOpen,
+      isNativeDownload,
+      saveDirectory,
+      browseSaveDirectory,
+      resetSaveDirectory,
       startVideoDownload,
       startSubtitleDownload,
       cancelDownload,

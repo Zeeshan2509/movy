@@ -544,6 +544,7 @@ interface RawTmdbSeasonResponse {
     still_path?: string | null;
     air_date?: string | null;
     runtime?: number | null;
+    vote_average?: number | null;
   }[];
 }
 
@@ -562,8 +563,10 @@ export async function fetchTvSeasonEpisodes(
     title: ep.name || `Episode ${ep.episode_number}`,
     overview: ep.overview || '',
     stillUrl: ep.still_path ? tmdbImageUrl(ep.still_path, 'w342') : null,
+    stillUrlLarge: ep.still_path ? tmdbImageUrl(ep.still_path, 'w780') : null,
     airDate: ep.air_date ?? null,
     runtime: ep.runtime ?? null,
+    rating: typeof ep.vote_average === 'number' ? ep.vote_average : null,
   }));
 }
 

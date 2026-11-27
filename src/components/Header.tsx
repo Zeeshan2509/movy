@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { AnimatePresence, LayoutGroup, motion } from 'motion/react';
 import { Bookmark, Download, X } from 'lucide-react';
 import { MoviesxMark } from '@/src/components/BrandMark';
 import { HeaderSearch } from '@/src/components/HeaderSearch';
@@ -7,15 +8,101 @@ import type { MediaItem, NavTab } from '@/src/types/media';
 
 interface HeaderProps {
   activeTab: NavTab;
+  isHeroPage?: boolean;
   onSelectTab: (tab: NavTab) => void;
   searchOpen: boolean;
   onOpenSearch: () => void;
   onCloseSearch: () => void;
   watchlistCount: number;
-  isInWatchlist: (id: number | string) => boolean;
-  onToggleWatchlist: (item: MediaItem) => void;
   onPlayMedia: (item: MediaItem) => void;
   onSelectMedia: (item: MediaItem) => void;
+}
+
+const SEARCH_TRANSITION = { duration: 0.58, ease: [0.22, 1, 0.36, 1] as const };
+
+interface MarkerRect {
+  left: number;
+  width: number;
+}
+
+const slidingMarkerCache = new Map<string, MarkerRect>();
+
+function useSlidingMarker(
+  cacheKey: string,
+  containerRef: React.RefObject<HTMLElement | null>,
+  activeDep: string | number | null,
+) {
+  const [rect, setRect] = useState<MarkerRect | null>(null);
+  const [animated, setAnimated] = useState(false);
+  const mountedRef = useRef(false);
+
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    const activeNodes = container?.querySelectorAll<HTMLElement>('[data-marker-active="true"]');
+    const activeEl = activeNodes && activeNodes.length > 0 ? activeNodes[activeNodes.length - 1] : null;
+    if (!container || !activeEl) {
+      mountedRef.current = false;
+      setRect(null);
+      return;
+    }
+
+    const nextRect: MarkerRect = { left: activeEl.offsetLeft, width: activeEl.offsetWidth };
+    const prevCached = slidingMarkerCache.get(cacheKey);
+    slidingMarkerCache.set(cacheKey, nextRect);
+
+    if (
+      !mountedRef.current &&
+      prevCached &&
+      (Math.abs(prevCached.left - nextRect.left) > 0.5 ||
+        Math.abs(prevCached.width - nextRect.width) > 0.5)
+    ) {
+      mountedRef.current = true;
+      setAnimated(false);
+      setRect(prevCached);
+      let raf2 = 0;
+      const raf1 = requestAnimationFrame(() => {
+        raf2 = requestAnimationFrame(() => {
+          setAnimated(true);
+          setRect(nextRect);
+        });
+      });
+      return () => {
+        cancelAnimationFrame(raf1);
+        cancelAnimationFrame(raf2);
+      };
+    }
+
+    setAnimated(mountedRef.current);
+    mountedRef.current = true;
+    setRect(nextRect);
+  }, [cacheKey, containerRef, activeDep]);
+
+  useEffect(() => {
+    const sync = () => {
+      const container = containerRef.current;
+      const activeNodes = container?.querySelectorAll<HTMLElement>('[data-marker-active="true"]');
+      const activeEl =
+        activeNodes && activeNodes.length > 0 ? activeNodes[activeNodes.length - 1] : null;
+      if (!activeEl) return;
+      const nextRect: MarkerRect = { left: activeEl.offsetLeft, width: activeEl.offsetWidth };
+      slidingMarkerCache.set(cacheKey, nextRect);
+      setAnimated(false);
+      setRect(nextRect);
+    };
+    window.addEventListener('resize', sync);
+    return () => window.removeEventListener('resize', sync);
+  }, [cacheKey, containerRef]);
+
+  const style: React.CSSProperties = {
+    transform: `translateX(${rect?.left ?? 0}px)`,
+    width: rect?.width ?? 0,
+    opacity: rect ? 1 : 0,
+    transition: animated
+      ? 'transform 0.35s cubic-bezier(0.22, 1, 0.36, 1), width 0.35s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease'
+      : 'opacity 0.2s ease',
+  };
+
+  return style;
 }
 
 const HomeIcon: React.FC<{ className?: string; size?: number }> = ({
@@ -126,26 +213,31 @@ const NAV_ITEMS: {
 
 export const Header: React.FC<HeaderProps> = ({
   activeTab,
+  isHeroPage = true,
   onSelectTab,
   searchOpen,
   onOpenSearch,
   onCloseSearch,
   watchlistCount,
-  isInWatchlist,
-  onToggleWatchlist,
   onPlayMedia,
   onSelectMedia,
 }) => {
+  const layoutGroupId = useId();
   const { activeDownloads, downloads, overallProgress, setDownloadsOpen } = useDownloadManager();
   const [scrolled, setScrolled] = useState(false);
   const [isDesktop, setIsDesktop] = useState(() =>
     typeof window !== 'undefined' ? window.matchMedia('(min-width: 768px)').matches : true,
   );
   const [navWidth, setNavWidth] = useState(0);
+  const [panelVisible, setPanelVisible] = useState(false);
+  const [panelClosing, setPanelClosing] = useState(false);
 
   const desktopNavHostRef = useRef<HTMLElement>(null);
-  const mobileDockHostRef = useRef<HTMLDivElement>(null);
   const navMeasureRef = useRef<HTMLDivElement>(null);
+  const desktopNavLinksRef = useRef<HTMLDivElement>(null);
+  const mobileDockRef = useRef<HTMLElement>(null);
+  const mobileDockHostRef = useRef<HTMLDivElement>(null);
+  const closeTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const mq = window.matchMedia('(min-width: 768px)');
@@ -155,8 +247,41 @@ export const Header: React.FC<HeaderProps> = ({
     return () => mq.removeEventListener('change', sync);
   }, []);
 
+  const desktopSearchOpen = searchOpen && isDesktop;
+  const mobileSearchOpen = searchOpen && !isDesktop;
+
+  // Delay search dropdown reveal until the 580ms icon glide completes
   useEffect(() => {
-    if (searchOpen) return;
+    if (!desktopSearchOpen) {
+      setPanelVisible(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setPanelVisible(true), 580);
+    return () => window.clearTimeout(timer);
+  }, [desktopSearchOpen]);
+
+  const handleCloseSearchAnimated = () => {
+    if (closeTimerRef.current !== null) return;
+    if (!isDesktop) {
+      onCloseSearch();
+      return;
+    }
+    setPanelClosing(true);
+    closeTimerRef.current = window.setTimeout(() => {
+      closeTimerRef.current = null;
+      setPanelClosing(false);
+      onCloseSearch();
+    }, 90);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (desktopSearchOpen) return;
     const measure = () => {
       const w = navMeasureRef.current?.scrollWidth ?? 0;
       if (w > 0) setNavWidth(w);
@@ -164,18 +289,18 @@ export const Header: React.FC<HeaderProps> = ({
     measure();
     window.addEventListener('resize', measure);
     return () => window.removeEventListener('resize', measure);
-  }, [searchOpen]);
+  }, [desktopSearchOpen]);
 
   useEffect(() => {
     if (!searchOpen) return;
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Element | null;
       if (!target?.closest?.('.header-search-cluster')) {
-        onCloseSearch();
+        handleCloseSearchAnimated();
       }
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCloseSearch();
+      if (e.key === 'Escape') handleCloseSearchAnimated();
     };
     document.addEventListener('pointerdown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
@@ -183,7 +308,7 @@ export const Header: React.FC<HeaderProps> = ({
       document.removeEventListener('pointerdown', onPointerDown);
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [searchOpen, onCloseSearch]);
+  });
 
   useEffect(() => {
     const handleScroll = () => setScrolled(window.scrollY > 24);
@@ -192,27 +317,44 @@ export const Header: React.FC<HeaderProps> = ({
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  const hasActiveDownloads = activeDownloads.length > 0;
-  const desktopSearchOpen = searchOpen && isDesktop;
-  const mobileSearchOpen = searchOpen && !isDesktop;
+  const desktopMarkerStyle = useSlidingMarker('desktop-nav', desktopNavLinksRef, activeTab);
+  const mobileMarkerStyle = useSlidingMarker('mobile-dock', mobileDockRef, activeTab);
 
+  const hasActiveDownloads = activeDownloads.length > 0;
+  const navLinkBase =
+    'relative z-[1] inline-flex items-center gap-1.5 h-8 px-3 rounded-[8px] text-[13px] transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white focus-visible:-outline-offset-2';
   const iconBtnClass =
     'flex items-center justify-center h-8 w-8 rounded-[8px] text-[#b3b3b3] hover:text-white hover:bg-white/[0.06] transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white focus-visible:-outline-offset-2';
 
+  const searchGlyphButton = (
+    <motion.button
+      type="button"
+      layoutId={`search-icon-${layoutGroupId}`}
+      transition={SEARCH_TRANSITION}
+      onClick={() => {
+        if (!desktopSearchOpen) onOpenSearch();
+      }}
+      aria-label="Search"
+      aria-expanded={desktopSearchOpen}
+      className={iconBtnClass}
+    >
+      <SearchIcon size={16} />
+    </motion.button>
+  );
+
   return (
     <>
-      {/* Original Top Header: Native draggable <a> M Logo left, unified right cluster bar */}
+      {/* Original Top Header */}
       <header
         className="fixed left-0 right-0 top-0 z-40 pointer-events-none"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}
       >
-        {/* Subtle scroll-activated top gradient scrim */}
         <div
           className="absolute inset-x-0 top-0 h-20 md:h-24 pointer-events-none"
           style={{
             background:
               'linear-gradient(180deg, rgba(15,15,15,0.92) 0%, rgba(15,15,15,0.55) 40%, rgba(15,15,15,0.3) 62%, rgba(15,15,15,0.13) 79%, rgba(15,15,15,0.04) 91%, rgba(15,15,15,0) 100%)',
-            opacity: scrolled ? 1 : 0,
+            opacity: isHeroPage && !scrolled ? 0 : scrolled ? 1 : 0.72,
             transition: 'opacity 0.25s ease',
             transform: 'translateZ(0)',
           }}
@@ -221,7 +363,6 @@ export const Header: React.FC<HeaderProps> = ({
 
         <div className="layout-container pointer-events-auto relative">
           <div className="flex items-center justify-between h-[68px] md:h-[80px]">
-            {/* Native Draggable Anchor Link M Logo (drag to tab bar to open new tab) */}
             <a
               href="/"
               draggable={true}
@@ -232,139 +373,160 @@ export const Header: React.FC<HeaderProps> = ({
                 }
               }}
               className="relative z-10 inline-flex items-center shrink-0 drop-shadow-[0_2px_10px_rgba(0,0,0,0.55)] focus:outline-none focus-visible:outline-2 focus-visible:outline-white focus-visible:outline-offset-4 rounded"
-              aria-label="Moviesx Home"
+              aria-label="Movy Home"
             >
               <MoviesxMark className="shrink-0 h-8 md:h-9 w-auto" />
             </a>
 
-            {/* Right Unified Nav Cluster (Desktop) — Original Movy expanding header-search-cluster */}
-            <nav
-              ref={desktopNavHostRef}
-              className="header-search-cluster relative hidden md:flex items-center h-10 pl-1 pr-1 rounded-[12px] border border-white/[0.08] bg-[#181818] shadow-[0_12px_32px_-14px_rgba(0,0,0,0.85)]"
-              aria-label="Main navigation"
-            >
-              <div
-                ref={navMeasureRef}
-                className="relative h-10 flex items-center"
-                style={navWidth ? { width: navWidth } : undefined}
+            {/* Right Unified Nav Cluster (Desktop) — Original Movy LayoutGroup glide */}
+            <LayoutGroup id={layoutGroupId}>
+              <nav
+                ref={desktopNavHostRef}
+                className="header-search-cluster relative hidden md:flex items-center h-10 pl-1 pr-1 rounded-[12px] border border-white/[0.08] bg-[#181818] shadow-[0_12px_32px_-14px_rgba(0,0,0,0.85)]"
+                aria-label="Main navigation"
               >
-                {desktopSearchOpen ? (
-                  <div className="w-full h-10 flex items-center gap-1">
-                    <span
-                      className="flex items-center justify-center h-8 w-8 shrink-0 text-white/85"
-                      aria-hidden="true"
-                    >
-                      <SearchIcon size={16} />
-                    </span>
-                    <div className="min-w-0 flex-1 h-10 flex items-center">
-                      <HeaderSearch
-                        onClose={onCloseSearch}
-                        panelHostRef={desktopNavHostRef}
-                        panelPlacement="below"
-                        autoFocusDelay={40}
-                        isInWatchlist={isInWatchlist}
-                        onToggleWatchlist={onToggleWatchlist}
-                        onPlay={onPlayMedia}
-                        onSelect={onSelectMedia}
-                      />
-                    </div>
-                  </div>
-                ) : (
-                  <div className="relative h-10 flex items-center gap-0.5 whitespace-nowrap">
-                    {NAV_ITEMS.map(({ id, label, Icon }) => {
-                      const isActive = activeTab === id;
-                      return (
-                        <button
-                          key={id}
-                          type="button"
-                          onClick={() => onSelectTab(id)}
-                          aria-current={isActive ? 'page' : undefined}
-                          className={`relative z-[1] inline-flex items-center gap-1.5 h-8 px-3 rounded-[8px] text-[13px] transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white focus-visible:-outline-offset-2 ${
-                            isActive
-                              ? 'bg-[#353535] text-white font-semibold'
-                              : 'text-[#b3b3b3] font-medium hover:text-white hover:bg-white/[0.06]'
-                          }`}
-                        >
-                          <Icon size={14} />
-                          <span>{label}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+                {desktopSearchOpen ? searchGlyphButton : null}
 
-              <span
-                className={`w-px h-4 mx-1.5 shrink-0 bg-white/[0.12] transition-opacity duration-200 ${
-                  desktopSearchOpen ? 'opacity-0' : 'opacity-100'
-                }`}
-                aria-hidden="true"
-              />
-
-              {desktopSearchOpen ? (
-                <button
-                  type="button"
-                  onClick={onCloseSearch}
-                  className={iconBtnClass}
-                  aria-label="Close search"
+                <div
+                  ref={navMeasureRef}
+                  className="relative h-10"
+                  style={navWidth ? { width: navWidth } : undefined}
                 >
-                  <X size={16} strokeWidth={1.75} />
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={onOpenSearch}
-                  className={iconBtnClass}
-                  aria-label="Search"
-                  aria-expanded="false"
-                >
-                  <SearchIcon size={16} />
-                </button>
-              )}
+                  <AnimatePresence initial={false}>
+                    {desktopSearchOpen ? (
+                      <motion.div
+                        key="search-field"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        transition={SEARCH_TRANSITION}
+                        className="absolute inset-0 z-10 h-10 overflow-hidden flex items-center"
+                      >
+                        <HeaderSearch
+                          onClose={handleCloseSearchAnimated}
+                          panelHostRef={desktopNavHostRef}
+                          panelVisible={panelVisible && !panelClosing}
+                          panelPlacement="below"
+                          autoFocusDelay={40}
+                          onPlay={onPlayMedia}
+                          onSelect={onSelectMedia}
+                        />
+                      </motion.div>
+                    ) : (
+                      <motion.div
+                        key="nav-links"
+                        ref={desktopNavLinksRef}
+                        initial={false}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        transition={SEARCH_TRANSITION}
+                        className="relative flex items-center gap-0.5 h-10 whitespace-nowrap"
+                      >
+                        <span
+                          aria-hidden="true"
+                          className="pointer-events-none absolute left-0 top-1 h-8 rounded-[8px] bg-[#353535]"
+                          style={desktopMarkerStyle}
+                        />
+                        {NAV_ITEMS.map(({ id, label, Icon }) => {
+                          const isActive = activeTab === id;
+                          return (
+                            <button
+                              key={id}
+                              type="button"
+                              onClick={() => onSelectTab(id)}
+                              aria-current={isActive ? 'page' : undefined}
+                              data-marker-active={isActive ? 'true' : undefined}
+                              className={`${navLinkBase} ${
+                                isActive
+                                  ? 'text-white font-semibold'
+                                  : 'text-[#b3b3b3] font-medium hover:text-white hover:bg-white/[0.06]'
+                              }`}
+                            >
+                              <Icon size={14} className="shrink-0" />
+                              <span>{label}</span>
+                            </button>
+                          );
+                        })}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
 
-              <button
-                type="button"
-                onClick={() => setDownloadsOpen(true)}
-                className={`relative ${iconBtnClass}`}
-                aria-label={`Downloads${
-                  hasActiveDownloads ? ` (${overallProgress}%)` : ''
-                }`}
-                title="Downloads & History"
-              >
-                <Download className="w-4 h-4" />
-                {hasActiveDownloads ? (
-                  <span className="absolute -top-0.5 -right-0.5 px-1 min-w-[16px] h-4 rounded-full bg-[#e50914] text-[9px] font-bold text-white flex items-center justify-center tabular-nums">
-                    {overallProgress}%
-                  </span>
-                ) : (
-                  downloads.length > 0 && (
-                    <span className="absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                  )
-                )}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => onSelectTab('watchlist')}
-                aria-current={activeTab === 'watchlist' ? 'page' : undefined}
-                className={`relative flex items-center justify-center h-8 w-8 rounded-[8px] transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white focus-visible:-outline-offset-2 ${
-                  activeTab === 'watchlist'
-                    ? 'bg-[#353535] text-white'
-                    : 'text-[#b3b3b3] hover:text-white hover:bg-white/[0.06]'
-                }`}
-                aria-label={`Watchlist${watchlistCount > 0 ? ` (${watchlistCount})` : ''}`}
-                title="Watchlist"
-              >
-                <Bookmark
-                  className={`w-4 h-4 ${
-                    activeTab === 'watchlist' ? 'fill-current' : ''
+                <span
+                  className={`w-px h-4 mx-1.5 shrink-0 bg-white/[0.12] transition-opacity duration-200 ${
+                    desktopSearchOpen ? 'opacity-0' : 'opacity-100'
                   }`}
+                  aria-hidden="true"
                 />
-                {watchlistCount > 0 && (
-                  <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-[#e50914]" />
+
+                {desktopSearchOpen ? (
+                  <button
+                    type="button"
+                    onClick={handleCloseSearchAnimated}
+                    className={`${iconBtnClass} overflow-visible`}
+                    aria-label="Close search"
+                  >
+                    <span className="relative flex items-center justify-center w-5 h-5">
+                      <motion.span
+                        key="close-x"
+                        initial={{ opacity: 0, rotate: -90, scale: 0.6 }}
+                        animate={{ opacity: 1, rotate: 0, scale: 1 }}
+                        exit={{ opacity: 0, rotate: 90, scale: 0.6 }}
+                        transition={SEARCH_TRANSITION}
+                        className="absolute inset-0 flex items-center justify-center"
+                      >
+                        <X size={16} strokeWidth={1.75} />
+                      </motion.span>
+                    </span>
+                  </button>
+                ) : (
+                  searchGlyphButton
                 )}
-              </button>
-            </nav>
+
+                <button
+                  type="button"
+                  onClick={() => setDownloadsOpen(true)}
+                  className={`relative ${iconBtnClass}`}
+                  aria-label={`Downloads${
+                    hasActiveDownloads ? ` (${overallProgress}%)` : ''
+                  }`}
+                  title="Downloads & History"
+                >
+                  <Download className="w-4 h-4" />
+                  {hasActiveDownloads ? (
+                    <span className="absolute -top-0.5 -right-0.5 px-1 min-w-[16px] h-4 rounded-full bg-[#e50914] text-[9px] font-bold text-white flex items-center justify-center tabular-nums">
+                      {overallProgress}%
+                    </span>
+                  ) : (
+                    downloads.length > 0 && (
+                      <span className="absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                    )
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => onSelectTab('watchlist')}
+                  aria-current={activeTab === 'watchlist' ? 'page' : undefined}
+                  className={`relative flex items-center justify-center h-8 w-8 rounded-[8px] transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white focus-visible:-outline-offset-2 ${
+                    activeTab === 'watchlist'
+                      ? 'bg-[#353535] text-white'
+                      : 'text-[#b3b3b3] hover:text-white hover:bg-white/[0.06]'
+                  }`}
+                  aria-label={`Watchlist${watchlistCount > 0 ? ` (${watchlistCount})` : ''}`}
+                  title="Watchlist"
+                >
+                  <Bookmark
+                    className={`w-4 h-4 ${
+                      activeTab === 'watchlist' ? 'fill-current' : ''
+                    }`}
+                  />
+                  {watchlistCount > 0 && (
+                    <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-[#e50914]" />
+                  )}
+                </button>
+              </nav>
+            </LayoutGroup>
           </div>
         </div>
       </header>
@@ -375,19 +537,19 @@ export const Header: React.FC<HeaderProps> = ({
         style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 12px)' }}
       >
         <div className="relative flex justify-center">
-          <div
-            className={
-              mobileSearchOpen
-                ? 'pointer-events-none opacity-0'
-                : 'pointer-events-auto opacity-100 transition-opacity duration-200'
-            }
+          <motion.div
+            animate={{ opacity: mobileSearchOpen ? 0 : 1 }}
+            transition={SEARCH_TRANSITION}
+            className={mobileSearchOpen ? 'pointer-events-none' : 'pointer-events-auto'}
             aria-hidden={mobileSearchOpen || undefined}
           >
             <nav
-              className="dock-panel flex items-center w-fit p-[3px] rounded-full bg-[#181818]/[0.97] border border-white/[0.08] shadow-[0_18px_40px_-12px_rgba(0,0,0,0.85)]"
+              ref={mobileDockRef}
+              className="mv-dock-panel"
               role="toolbar"
               aria-label="Main navigation"
             >
+              <span aria-hidden="true" className="mv-dock-marker" style={mobileMarkerStyle} />
               {NAV_ITEMS.map(({ id, label, Icon }) => {
                 const isActive = activeTab === id;
                 return (
@@ -396,28 +558,22 @@ export const Header: React.FC<HeaderProps> = ({
                     type="button"
                     onClick={() => onSelectTab(id)}
                     aria-label={label}
-                    aria-pressed={isActive}
-                    className={`inline-flex items-center justify-center w-11 h-11 rounded-full shrink-0 transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white ${
-                      isActive
-                        ? 'bg-[#353535] text-white'
-                        : 'text-[#b3b3b3] hover:text-white'
-                    }`}
+                    aria-pressed={isActive || undefined}
+                    data-marker-active={isActive ? 'true' : undefined}
+                    className={`mv-dock-item ${isActive ? 'is-active' : ''}`}
                   >
                     <Icon size={20} />
                   </button>
                 );
               })}
 
-              <span
-                className="w-px h-5 mx-1 shrink-0 bg-white/[0.1]"
-                aria-hidden="true"
-              />
+              <span className="mv-dock-divider" aria-hidden="true" />
 
               <button
                 type="button"
                 onClick={onOpenSearch}
                 aria-label="Search"
-                className="inline-flex items-center justify-center w-11 h-11 rounded-full shrink-0 text-[#b3b3b3] hover:text-white transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white"
+                className="mv-dock-item"
               >
                 <SearchIcon size={18} />
               </button>
@@ -426,7 +582,7 @@ export const Header: React.FC<HeaderProps> = ({
                 type="button"
                 onClick={() => setDownloadsOpen(true)}
                 aria-label="Downloads & History"
-                className="relative inline-flex items-center justify-center w-11 h-11 rounded-full shrink-0 text-[#b3b3b3] hover:text-white transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white"
+                className="mv-dock-item"
               >
                 <Download className="w-[18px] h-[18px]" />
                 {hasActiveDownloads ? (
@@ -444,12 +600,9 @@ export const Header: React.FC<HeaderProps> = ({
                 type="button"
                 onClick={() => onSelectTab('watchlist')}
                 aria-label="Watchlist"
-                aria-pressed={activeTab === 'watchlist'}
-                className={`relative inline-flex items-center justify-center w-11 h-11 rounded-full shrink-0 transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white ${
-                  activeTab === 'watchlist'
-                    ? 'bg-[#353535] text-white'
-                    : 'text-[#b3b3b3] hover:text-white'
-                }`}
+                aria-pressed={activeTab === 'watchlist' || undefined}
+                data-marker-active={activeTab === 'watchlist' ? 'true' : undefined}
+                className={`mv-dock-item ${activeTab === 'watchlist' ? 'is-active' : ''}`}
               >
                 <Bookmark
                   className={`w-[19px] h-[19px] ${
@@ -461,45 +614,53 @@ export const Header: React.FC<HeaderProps> = ({
                 )}
               </button>
             </nav>
-          </div>
+          </motion.div>
 
-          {mobileSearchOpen && (
-            <div className="pointer-events-auto absolute inset-y-0 left-1/2 w-[min(calc(100vw-32px),420px)] -translate-x-1/2">
-              <div
-                ref={mobileDockHostRef}
-                className="header-search-cluster relative flex h-full items-center gap-1 p-[3px] rounded-full bg-[#181818]/[0.97] border border-white/[0.08] shadow-[0_18px_40px_-12px_rgba(0,0,0,0.85)]"
+          <AnimatePresence>
+            {mobileSearchOpen && (
+              <motion.div
+                key="dock-search"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={SEARCH_TRANSITION}
+                className="pointer-events-auto absolute inset-y-0 left-1/2 w-[min(calc(100vw-32px),420px)] -translate-x-1/2"
               >
-                <span
-                  className="inline-flex items-center justify-center w-11 h-11 rounded-full shrink-0 text-[#b3b3b3]"
-                  aria-hidden="true"
+                <div
+                  ref={mobileDockHostRef}
+                  className="header-search-cluster mv-dock-surface relative flex h-full items-center gap-1 p-[3px]"
                 >
-                  <SearchIcon size={18} />
-                </span>
+                  <span className="mv-dock-item !cursor-default" aria-hidden="true">
+                    <SearchIcon size={18} />
+                  </span>
 
-                <div className="flex h-11 min-w-0 flex-1 items-center">
-                  <HeaderSearch
-                    onClose={onCloseSearch}
-                    panelHostRef={mobileDockHostRef}
-                    panelPlacement="above"
-                    autoFocusDelay={60}
-                    isInWatchlist={isInWatchlist}
-                    onToggleWatchlist={onToggleWatchlist}
-                    onPlay={onPlayMedia}
-                    onSelect={onSelectMedia}
-                  />
+                  <div className="flex h-11 min-w-0 flex-1 items-center">
+                    <HeaderSearch
+                      onClose={onCloseSearch}
+                      panelHostRef={mobileDockHostRef}
+                      panelVisible={true}
+                      panelPlacement="above"
+                      autoFocusDelay={60}
+                      onPlay={onPlayMedia}
+                      onSelect={onSelectMedia}
+                    />
+                  </div>
+
+                  <motion.button
+                    type="button"
+                    onClick={onCloseSearch}
+                    initial={{ opacity: 0, rotate: -90, scale: 0.6 }}
+                    animate={{ opacity: 1, rotate: 0, scale: 1 }}
+                    transition={SEARCH_TRANSITION}
+                    aria-label="Close search"
+                    className="mv-dock-item"
+                  >
+                    <X size={18} strokeWidth={1.5} />
+                  </motion.button>
                 </div>
-
-                <button
-                  type="button"
-                  onClick={onCloseSearch}
-                  aria-label="Close search"
-                  className="inline-flex items-center justify-center w-11 h-11 rounded-full shrink-0 text-[#b3b3b3] hover:text-white transition-colors duration-200 focus-visible:outline-2 focus-visible:outline-white"
-                >
-                  <X size={18} strokeWidth={1.5} />
-                </button>
-              </div>
-            </div>
-          )}
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
       </div>
     </>

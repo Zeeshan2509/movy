@@ -33,8 +33,10 @@ export interface MediaEpisode {
   title: string;
   overview?: string;
   stillUrl?: string | null;
+  stillUrlLarge?: string | null;
   airDate?: string | null;
   runtime?: number | null;
+  rating?: number | null;
   animeServerIds?: string;
 }
 
@@ -135,6 +137,7 @@ export interface DownloadRecord {
   statusText: string;
   bytesDownloaded: number;
   totalBytes?: number | null;
+  savePath?: string | null;
   createdAt: number;
   completedAt?: number | null;
 }

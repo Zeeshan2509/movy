@@ -17,6 +17,8 @@
         "height": 800,
         "minWidth": 375,
         "minHeight": 640,
+        "maximized": true,
+        "backgroundColor": "#0f0f0f",
         "resizable": true,
         "fullscreen": false
       }

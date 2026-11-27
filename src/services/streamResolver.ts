@@ -7,6 +7,47 @@ import type {
 
 const SUBTITLES_API_URL = 'https://subtitles.vidy.st';
 
+let cachedProxyOriginPromise: Promise<string> | null = null;
+
+export function isTauriRuntime(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+export async function getStreamProxyOrigin(): Promise<string> {
+  if (!isTauriRuntime()) return '';
+  if (!cachedProxyOriginPromise) {
+    cachedProxyOriginPromise = import('@tauri-apps/api/core')
+      .then(({ invoke }) => invoke<string>('get_proxy_origin'))
+      .catch(() => '');
+  }
+  const origin = await cachedProxyOriginPromise;
+  if (!origin) {
+    cachedProxyOriginPromise = null;
+  }
+  return origin;
+}
+
+export function normalizeStreamUrl(url: string, proxyOrigin: string): string {
+  if (!url) return url;
+  if (proxyOrigin && url.startsWith('/api/streams/')) {
+    return `${proxyOrigin}${url}`;
+  }
+  return url;
+}
+
+async function parseJsonResponse<T>(res: Response): Promise<T> {
+  const ct = res.headers.get('content-type') || '';
+  const text = await res.text();
+  if (ct.includes('text/html') || /^\s*<!doctype|^\s*<html/i.test(text)) {
+    throw new Error('Stream backend endpoint is unavailable');
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error('Invalid JSON response from stream backend');
+  }
+}
+
 export interface MovyServerMeta {
   id: string;
   name: string;
@@ -276,7 +317,8 @@ export async function fetchBackendMovieTvSources(
   if (imdbId) params.set('imdbId', String(imdbId));
 
   try {
-    const res = await fetch(`/api/streams/resolve?${params.toString()}`, {
+    const proxyOrigin = await getStreamProxyOrigin();
+    const res = await fetch(`${proxyOrigin}/api/streams/resolve?${params.toString()}`, {
       signal: signal ?? AbortSignal.timeout(18000),
     });
     if (!res.ok) {
@@ -289,11 +331,21 @@ export async function fetchBackendMovieTvSources(
       };
     }
 
-    const data = (await res.json()) as {
+    const data = await parseJsonResponse<{
       servers?: ResolvedBackendServer[];
       error?: string;
-    };
-    const servers = (data.servers || []).filter((s) => s.sources?.length > 0);
+    }>(res);
+
+    const servers = (data.servers || [])
+      .filter((s) => s.sources?.length > 0)
+      .map((s) => ({
+        ...s,
+        sources: s.sources.map((src) => ({
+          ...src,
+          url: normalizeStreamUrl(src.url, proxyOrigin),
+        })),
+      }));
+
     if (servers.length === 0) {
       return {
         servers: [],
@@ -346,20 +398,24 @@ export async function fetchAnimeEpisodeStream(
   }
 
   try {
+    const proxyOrigin = await getStreamProxyOrigin();
     const params = new URLSearchParams({
       serverIds: episode.animeServerIds,
       audio: audioType,
     });
-    const res = await fetch(`/api/streams/anime?${params.toString()}`, {
+    const res = await fetch(`${proxyOrigin}/api/streams/anime?${params.toString()}`, {
       signal: signal ?? AbortSignal.timeout(16000),
     });
     if (!res.ok) return { sources: [], subtitles: [] };
-    const data = (await res.json()) as {
+    const data = await parseJsonResponse<{
       sources?: StreamSourceOption[];
       subtitles?: SubtitleTrack[];
-    };
+    }>(res);
     return {
-      sources: data.sources || [],
+      sources: (data.sources || []).map((src) => ({
+        ...src,
+        url: normalizeStreamUrl(src.url, proxyOrigin),
+      })),
       subtitles: filterEnglishSubtitles(data.subtitles || []),
     };
   } catch {
@@ -814,5 +870,81 @@ export async function downloadSubtitleFile(options: {
     a.click();
     a.remove();
     return { bytesDownloaded: 0, finalFilename: filename };
+  }
+}
+
+export async function getDefaultDownloadDir(): Promise<string> {
+  if (!isTauriRuntime()) return '';
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<string>('get_default_download_dir');
+  } catch {
+    return '';
+  }
+}
+
+export async function pickDownloadFolder(currentDir?: string): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<string | null>('pick_download_folder', {
+      currentDir: currentDir || null,
+    });
+  } catch {
+    return null;
+  }
+}
+
+export async function cancelTauriDownload(downloadId: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('cancel_tauri_download', { downloadId });
+  } catch {
+    // Ignore
+  }
+}
+
+export interface TauriProgressPayload {
+  id: string;
+  percent: number;
+  label: string;
+  bytesDownloaded: number;
+  totalBytes: number | null;
+}
+
+export async function downloadViaTauriToDisk(options: {
+  downloadId: string;
+  url: string;
+  saveDir: string;
+  filename: string;
+  onProgress?: (payload: TauriProgressPayload) => void;
+}): Promise<{ bytesDownloaded: number; finalFilename: string; fullPath: string }> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  const { listen } = await import('@tauri-apps/api/event');
+
+  let unlisten: (() => void) | null = null;
+  if (options.onProgress) {
+    unlisten = await listen<TauriProgressPayload>('download-progress', (event) => {
+      if (event.payload && event.payload.id === options.downloadId) {
+        options.onProgress?.(event.payload);
+      }
+    });
+  }
+
+  try {
+    const res = await invoke<{
+      bytesDownloaded: number;
+      finalFilename: string;
+      fullPath: string;
+    }>('download_file_to_path', {
+      downloadId: options.downloadId,
+      url: options.url,
+      saveDir: options.saveDir,
+      filename: options.filename,
+    });
+    return res;
+  } finally {
+    if (unlisten) unlisten();
   }
 }
