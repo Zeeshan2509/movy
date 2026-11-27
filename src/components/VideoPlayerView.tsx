@@ -13,6 +13,7 @@ import {
   Maximize2,
   Minimize2,
   Search,
+  SkipForward,
   SlidersHorizontal,
   Upload,
   X,
@@ -298,6 +299,12 @@ const MovyLoaderRing: React.FC<{ className?: string }> = ({ className }) => (
 const TOP_BAR_BTN_CLASS =
   'tabbable flex items-center gap-2 p-2 md:px-3 md:py-2 rounded-lg text-white/90 hover:text-white hover:bg-white/10 transition-all text-sm font-semibold whitespace-nowrap shrink-0';
 
+const PILL_GROUP_CLASS =
+  'flex items-center bg-white/[0.08] border border-white/15 backdrop-blur-md rounded-2xl shadow-2xl';
+
+const PILL_ICON_BTN_CLASS =
+  'tabbable flex items-center gap-1.5 p-1.5 md:p-2 rounded-xl border border-transparent text-white/90 hover:text-white hover:bg-white/10 transition-all text-xs md:text-sm font-semibold whitespace-nowrap shrink-0 active:scale-95';
+
 export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
   item,
   initialSeason = 1,
@@ -319,6 +326,14 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
   const qualityPopoverRef = useRef<HTMLDivElement>(null);
   const subsPopoverRef = useRef<HTMLDivElement>(null);
   const lastTapRef = useRef<{ time: number; side: 'left' | 'right' | 'center' } | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  const seekFeedbackTimerRef = useRef<number | null>(null);
+  const lastSeekDirRef = useRef<'back' | 'forward' | null>(null);
+  const lastSeekAtRef = useRef<number>(0);
+  const seekAccumRef = useRef<number>(0);
+  const osdTimerRef = useRef<number | null>(null);
+  const centerPulseTimerRef = useRef<number | null>(null);
 
   const [isTouchDevice, setIsTouchDevice] = useState(() =>
     typeof window !== 'undefined'
@@ -422,7 +437,21 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
   });
   const [isSeeking, setIsSeeking] = useState(false);
   const [seekPreview, setSeekPreview] = useState<{ time: number; offsetPx: number } | null>(null);
-  const [seekFeedback, setSeekFeedback] = useState<'back' | 'forward' | null>(null);
+  const [seekFeedback, setSeekFeedback] = useState<{
+    side: 'back' | 'forward';
+    seconds: number;
+    key: number;
+  } | null>(null);
+  const [mobileBoostLevel, setMobileBoostLevel] = useState<0 | 1 | 2>(0);
+  const [osdBadge, setOsdBadge] = useState<{
+    show: boolean;
+    kind: 'volume' | 'subs';
+    text: string;
+    color: string;
+    volumeLevel?: number;
+    muted?: boolean;
+  }>({ show: false, kind: 'volume', text: '100%', color: '#ffffff' });
+  const [centerPulse, setCenterPulse] = useState<'play' | 'pause' | null>(null);
 
   const activeSource = sources[selectedSourceIdx] ?? null;
 
@@ -945,13 +974,124 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
     };
   }, [activeSource, selectedSourceIdx, sources.length]);
 
-  // Sync volume, mute, playbackRate with video element & localStorage
+  const triggerVolumeOsd = useCallback(
+    (levelPct: number, mutedState: boolean, customText?: string, customColor?: string) => {
+      const color =
+        customColor ??
+        (levelPct > 125 ? '#ef4444' : levelPct > 100 ? '#f97316' : '#ffffff');
+      const text = customText ?? (mutedState || levelPct === 0 ? 'Muted' : `${levelPct}%`);
+      setOsdBadge({
+        show: true,
+        kind: 'volume',
+        text,
+        color,
+        volumeLevel: levelPct,
+        muted: mutedState,
+      });
+      if (osdTimerRef.current) window.clearTimeout(osdTimerRef.current);
+      osdTimerRef.current = window.setTimeout(() => {
+        setOsdBadge((prev) => ({ ...prev, show: false }));
+      }, 1100);
+    },
+    [],
+  );
+
+  const triggerSubsOsd = useCallback((text: string) => {
+    setOsdBadge({
+      show: true,
+      kind: 'subs',
+      text,
+      color: '#ffffff',
+    });
+    if (osdTimerRef.current) window.clearTimeout(osdTimerRef.current);
+    osdTimerRef.current = window.setTimeout(() => {
+      setOsdBadge((prev) => ({ ...prev, show: false }));
+    }, 1100);
+  }, []);
+
+  const ensureGainNode = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return null;
+    if (gainNodeRef.current) {
+      if (audioCtxRef.current?.state === 'suspended') {
+        void audioCtxRef.current.resume().catch(() => {});
+      }
+      return gainNodeRef.current;
+    }
+    try {
+      const AudioContextCtor =
+        window.AudioContext ||
+        (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextCtor) return null;
+      const ctx = new AudioContextCtor();
+      const source = ctx.createMediaElementSource(v);
+      const gainNode = ctx.createGain();
+      source.connect(gainNode);
+      gainNode.connect(ctx.destination);
+      audioCtxRef.current = ctx;
+      gainNodeRef.current = gainNode;
+      if (ctx.state === 'suspended') {
+        void ctx.resume().catch(() => {});
+      }
+      return gainNode;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const toggleMobileVolumeBoost = useCallback(() => {
+    const nextLevel: 0 | 1 | 2 = mobileBoostLevel === 0 ? 1 : mobileBoostLevel === 1 ? 2 : 0;
+    const gainValue = nextLevel === 1 ? 1.25 : nextLevel === 2 ? 1.5 : 1.0;
+
+    if (nextLevel > 0) {
+      setIsMuted(false);
+      setVolume(100);
+      const gain = ensureGainNode();
+      if (gain) gain.gain.value = gainValue;
+    } else if (gainNodeRef.current) {
+      gainNodeRef.current.gain.value = 1.0;
+    }
+
+    setMobileBoostLevel(nextLevel);
+    if (nextLevel === 1) {
+      triggerVolumeOsd(125, false, '+25%', '#f97316');
+    } else if (nextLevel === 2) {
+      triggerVolumeOsd(150, false, '+50%', '#ef4444');
+    } else {
+      triggerVolumeOsd(100, false, 'Boost Off', '#ffffff');
+    }
+  }, [ensureGainNode, mobileBoostLevel, triggerVolumeOsd]);
+
+  useEffect(() => {
+    return () => {
+      if (audioCtxRef.current) {
+        void audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current = null;
+        gainNodeRef.current = null;
+      }
+      if (osdTimerRef.current) window.clearTimeout(osdTimerRef.current);
+      if (seekFeedbackTimerRef.current) window.clearTimeout(seekFeedbackTimerRef.current);
+      if (centerPulseTimerRef.current) window.clearTimeout(centerPulseTimerRef.current);
+    };
+  }, []);
+
+  // Sync volume, mute, mobile boost gain, playbackRate with video element & localStorage
   useEffect(() => {
     const v = videoRef.current;
+    const boostGain =
+      isTouchDevice && mobileBoostLevel === 1
+        ? 1.25
+        : isTouchDevice && mobileBoostLevel === 2
+          ? 1.5
+          : 1.0;
+
     if (v) {
       v.muted = isMuted;
       v.volume = isMuted ? 0 : volume / 100;
       v.playbackRate = playbackSpeed;
+    }
+    if (gainNodeRef.current) {
+      gainNodeRef.current.gain.value = isMuted ? 0 : boostGain;
     }
     try {
       localStorage.setItem(STORAGE_KEYS.volume, String(volume));
@@ -959,7 +1099,7 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
     } catch {
       // Ignore
     }
-  }, [volume, isMuted, playbackSpeed]);
+  }, [volume, isMuted, playbackSpeed, isTouchDevice, mobileBoostLevel]);
 
   // Sync subtitle settings to localStorage
   const updateSubtitleSettings = useCallback((patch: Partial<SubtitleSettings>) => {
@@ -1060,16 +1200,32 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
   }, []);
 
   // Playback controls
-  const togglePlayPause = useCallback(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (v.paused) {
-      v.play().catch(() => {});
-    } else {
-      v.pause();
-    }
-    showControls();
-  }, [showControls]);
+  const togglePlayPause = useCallback(
+    (withPulse = false) => {
+      const v = videoRef.current;
+      if (!v) return;
+      if (audioCtxRef.current?.state === 'suspended') {
+        void audioCtxRef.current.resume().catch(() => {});
+      }
+      if (v.paused) {
+        v.play().catch(() => {});
+        if (withPulse) {
+          setCenterPulse('play');
+          if (centerPulseTimerRef.current) window.clearTimeout(centerPulseTimerRef.current);
+          centerPulseTimerRef.current = window.setTimeout(() => setCenterPulse(null), 350);
+        }
+      } else {
+        v.pause();
+        if (withPulse) {
+          setCenterPulse('pause');
+          if (centerPulseTimerRef.current) window.clearTimeout(centerPulseTimerRef.current);
+          centerPulseTimerRef.current = window.setTimeout(() => setCenterPulse(null), 350);
+        }
+      }
+      showControls();
+    },
+    [showControls],
+  );
 
   const seekBy = useCallback(
     (deltaSeconds: number) => {
@@ -1078,8 +1234,24 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
       const next = Math.max(0, Math.min(v.duration, v.currentTime + deltaSeconds));
       v.currentTime = next;
       setCurrentTime(next);
-      setSeekFeedback(deltaSeconds < 0 ? 'back' : 'forward');
-      window.setTimeout(() => setSeekFeedback(null), 500);
+
+      const side: 'back' | 'forward' = deltaSeconds < 0 ? 'back' : 'forward';
+      const now = Date.now();
+      if (lastSeekDirRef.current === side && now - lastSeekAtRef.current < 750) {
+        seekAccumRef.current += Math.abs(deltaSeconds);
+      } else {
+        seekAccumRef.current = Math.abs(deltaSeconds);
+      }
+      lastSeekDirRef.current = side;
+      lastSeekAtRef.current = now;
+
+      setSeekFeedback({ side, seconds: seekAccumRef.current, key: now });
+      if (seekFeedbackTimerRef.current) window.clearTimeout(seekFeedbackTimerRef.current);
+      seekFeedbackTimerRef.current = window.setTimeout(() => {
+        setSeekFeedback(null);
+        lastSeekDirRef.current = null;
+        seekAccumRef.current = 0;
+      }, 650);
       showControls();
     },
     [showControls],
@@ -1199,22 +1371,46 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
 
     const onKeyDown = (e: KeyboardEvent) => {
       const activeTag = document.activeElement?.tagName.toLowerCase();
-      if (activeTag === 'input' || activeTag === 'textarea') return;
+      if (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select') return;
 
       if (e.key === 'Escape') {
         if (openMenu) setOpenMenu(null);
         else if (episodesDrawerOpen) setEpisodesDrawerOpen(false);
         else if (isFullscreen) void exitFullscreenMode();
         else onClose();
-      } else if (e.key === ' ' || e.key === 'k' || e.key === 'K') {
+      } else if (e.key === ' ' || e.key === 'k' || e.key === 'K' || e.code === 'KeyK') {
         e.preventDefault();
-        togglePlayPause();
-      } else if (e.key === 'f' || e.key === 'F') {
+        togglePlayPause(true);
+      } else if (e.key === 'f' || e.key === 'F' || e.code === 'KeyF') {
         e.preventDefault();
         void toggleFullscreen();
-      } else if (e.key === 'm' || e.key === 'M') {
+      } else if (e.key === 'm' || e.key === 'M' || e.code === 'KeyM') {
         e.preventDefault();
-        setIsMuted((m) => !m);
+        setIsMuted((prevMuted) => {
+          const nextMuted = !prevMuted;
+          triggerVolumeOsd(nextMuted ? 0 : volume, nextMuted);
+          return nextMuted;
+        });
+        showControls();
+      } else if (e.key === 'c' || e.key === 'C' || e.code === 'KeyC') {
+        e.preventDefault();
+        if (subtitles.length === 0 && !selectedSub) {
+          triggerSubsOsd('Subtitles Unavailable');
+          showControls();
+          return;
+        }
+        if (isSubOff) {
+          const target = selectedSub || subtitles[0] || null;
+          if (target) {
+            selectSubtitle(target);
+            triggerSubsOsd('Subtitles On');
+          } else {
+            triggerSubsOsd('Subtitles Unavailable');
+          }
+        } else {
+          selectSubtitle(null);
+          triggerSubsOsd('Subtitles Off');
+        }
         showControls();
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
@@ -1225,11 +1421,20 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         setIsMuted(false);
-        setVolume((v) => Math.min(100, v + 5));
+        setVolume((v) => {
+          const next = Math.min(100, v + 5);
+          triggerVolumeOsd(next, false);
+          return next;
+        });
         showControls();
       } else if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setVolume((v) => Math.max(0, v - 5));
+        setVolume((v) => {
+          const next = Math.max(0, v - 5);
+          if (next === 0) setIsMuted(true);
+          triggerVolumeOsd(next, next === 0);
+          return next;
+        });
         showControls();
       }
     };
@@ -1254,12 +1459,19 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
     episodesDrawerOpen,
     exitFullscreenMode,
     isFullscreen,
+    isSubOff,
     onClose,
     openMenu,
     seekBy,
+    selectSubtitle,
+    selectedSub,
     showControls,
+    subtitles,
     toggleFullscreen,
     togglePlayPause,
+    triggerSubsOsd,
+    triggerVolumeOsd,
+    volume,
   ]);
 
   // Interactive SeekBar drag & hover preview
@@ -1403,6 +1615,586 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
       setOpenMenu((prev) => (prev === 'subs' && subsView !== 'main' ? prev : null));
     }, 100);
   };
+
+  const renderQualityPopoverPanel = () => (
+    <div className="player-surface rounded-xl p-4 shadow-2xl overflow-x-hidden">
+      <div className="flex divide-x divide-white/10 max-h-[min(400px,58vh)]">
+        {/* Quality Column */}
+        <div className="min-w-[130px] md:min-w-[160px] max-w-[210px] flex flex-col min-h-0 pr-3 md:pr-4">
+          <p className="px-2.5 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
+            Quality
+          </p>
+          <div className="flex-1 min-h-0 overflow-y-auto custom-vertical-scroll space-y-0.5 pr-1">
+            {streamResolving && sources.length === 0 ? (
+              <div className="flex h-24 items-center justify-center px-3">
+                <p className="text-center text-xs text-white/60">Finding best server...</p>
+              </div>
+            ) : hlsQualities.length > 0 ? (
+              hlsQualities.map((q) => (
+                <button
+                  key={q.levelIndex}
+                  type="button"
+                  onClick={() => {
+                    setSelectedHlsLevel(q.levelIndex);
+                    if (hlsRef.current) {
+                      hlsRef.current.currentLevel = q.levelIndex;
+                    }
+                  }}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                    selectedHlsLevel === q.levelIndex
+                      ? 'text-white bg-white/[0.14]'
+                      : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                  }`}
+                >
+                  <span className="flex-1 min-w-0">
+                    <span className="block truncate">{q.label}</span>
+                    {q.caption && (
+                      <span className="block text-[11px] font-normal text-gray-500 mt-0.5">
+                        {q.caption}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              ))
+            ) : sources.length > 0 ? (
+              sources.map((src, idx) => (
+                <button
+                  key={src.id}
+                  type="button"
+                  onClick={() => setSelectedSourceIdx(idx)}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                    idx === selectedSourceIdx
+                      ? 'text-white bg-white/[0.14]'
+                      : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                  }`}
+                >
+                  <span className="flex-1 min-w-0">
+                    <span className="block truncate">{src.quality}</span>
+                    {qualityCaption(src.quality) && (
+                      <span className="block text-[11px] font-normal text-gray-500 mt-0.5">
+                        {qualityCaption(src.quality)}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              ))
+            ) : (
+              <div className="flex h-20 items-center justify-center px-3">
+                <p className="text-center text-xs text-white/55">No stream loaded</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Server Column */}
+        <div className="min-w-[165px] md:min-w-[205px] max-w-[250px] flex flex-col min-h-0 pl-3 md:pl-4">
+          <p className="px-2.5 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
+            Server
+          </p>
+          <div className="flex-1 min-h-0 overflow-y-auto custom-vertical-scroll space-y-0.5 pr-1">
+            {item.mediaType === 'anime' ? (
+              <>
+                <div className="grid grid-cols-2 gap-1 p-1 mb-1 rounded-lg bg-white/[0.05]">
+                  {(['sub', 'dub'] as const).map((aud) => (
+                    <button
+                      key={aud}
+                      type="button"
+                      onClick={() => setAnimeAudio(aud)}
+                      className={`h-7 rounded-md text-[11px] font-bold uppercase transition ${
+                        animeAudio === aud
+                          ? 'bg-white text-black'
+                          : 'text-gray-300 hover:text-white'
+                      }`}
+                    >
+                      {aud}
+                    </button>
+                  ))}
+                </div>
+                {sources.map((src, idx) => (
+                  <button
+                    key={src.id}
+                    type="button"
+                    onClick={() => setSelectedSourceIdx(idx)}
+                    className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                      idx === selectedSourceIdx
+                        ? 'text-white bg-white/[0.14]'
+                        : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                    }`}
+                  >
+                    <span className="flex-1 truncate">{src.serverName || src.label}</span>
+                  </button>
+                ))}
+              </>
+            ) : (
+              (resolvedServers.length > 0 ? resolvedServers : MOVY_SERVERS).map((srv) => {
+                const status = serverStatuses[srv.id] || 'idle';
+                const isActive = activeServerId === srv.id;
+                const isFav = favoriteServer === srv.tag;
+                return (
+                  <button
+                    key={srv.id}
+                    type="button"
+                    onClick={() => void switchToMovyServer(srv.id)}
+                    className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                      isActive
+                        ? 'text-white bg-white/[0.14]'
+                        : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                    }`}
+                  >
+                    <img
+                      src={flagSvgUrl(srv.flagCode)}
+                      alt={srv.name}
+                      className="w-5 h-[15px] rounded-[3px] object-cover flex-shrink-0"
+                    />
+                    <span className="flex-1 min-w-0">
+                      <span className="block truncate">{srv.name}</span>
+                      {srv.note && (
+                        <span className="block text-[10px] text-gray-500 truncate">
+                          {srv.note}
+                        </span>
+                      )}
+                    </span>
+                    {status === 'loading' ? (
+                      <Loader2 size={13} className="animate-spin text-gray-400 flex-shrink-0" />
+                    ) : status === 'error' ? (
+                      <AlertCircle size={13} className="text-red-400 flex-shrink-0" />
+                    ) : null}
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`Favorite ${srv.name}`}
+                      onClick={(ev) => toggleFavoriteServer(ev, srv.tag)}
+                      onKeyDown={(ev) => {
+                        if (ev.key === 'Enter' || ev.key === ' ') {
+                          toggleFavoriteServer(ev, srv.tag);
+                        }
+                      }}
+                      className="p-1 -m-0.5 rounded-md text-gray-500 hover:text-red-400 hover:bg-white/10 transition-colors flex-shrink-0 cursor-pointer"
+                    >
+                      <Heart
+                        width={13}
+                        height={13}
+                        fill={isFav ? 'rgb(239,68,68)' : 'none'}
+                        stroke={isFav ? 'rgb(239,68,68)' : 'currentColor'}
+                      />
+                    </span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Speed Row */}
+      <div className="mt-3 flex items-center gap-2 border-t border-white/10 pt-3">
+        <span className="px-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
+          Speed
+        </span>
+        <div className="flex flex-1 items-center gap-1">
+          {SPEED_OPTIONS.map((spd) => (
+            <button
+              key={spd}
+              type="button"
+              onClick={() => setPlaybackSpeed(spd)}
+              className={`flex-1 rounded-full px-1.5 py-1.5 text-[11.5px] font-semibold tabular-nums transition-colors ${
+                playbackSpeed === spd
+                  ? 'bg-white text-black'
+                  : 'text-gray-400 hover:bg-white/10 hover:text-white'
+              }`}
+            >
+              {spd}x
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderSubsPopoverPanel = () => (
+    <div className="player-surface rounded-xl p-4 shadow-2xl overflow-x-hidden">
+      {subsView === 'main' ? (
+        <div className="flex flex-col">
+          <div className="flex divide-x divide-white/10 max-h-[min(360px,50vh)]">
+            {/* Audios Column */}
+            <div className="min-w-[145px] md:min-w-[180px] max-w-[230px] flex flex-col min-h-0 pr-3 md:pr-4">
+              <p className="px-2.5 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
+                Audios
+              </p>
+              <div className="flex-1 min-h-0 overflow-y-auto custom-vertical-scroll space-y-0.5 pr-1">
+                {hlsAudios.length > 0 ? (
+                  hlsAudios.map((aud) => (
+                    <button
+                      key={aud.index}
+                      type="button"
+                      onClick={() => {
+                        setSelectedHlsAudio(aud.index);
+                        if (hlsRef.current) hlsRef.current.audioTrack = aud.index;
+                      }}
+                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                        selectedHlsAudio === aud.index
+                          ? 'text-white bg-white/[0.14]'
+                          : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                      }`}
+                    >
+                      <span className="truncate">{aud.name}</span>
+                    </button>
+                  ))
+                ) : item.mediaType === 'anime' ? (
+                  ([
+                    { id: 'sub', label: 'Japanese (Sub)' },
+                    { id: 'dub', label: 'English (Dub)' },
+                  ] as const).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setAnimeAudio(opt.id)}
+                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                        animeAudio === opt.id
+                          ? 'text-white bg-white/[0.14]'
+                          : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                      }`}
+                    >
+                      <span className="truncate">{opt.label}</span>
+                    </button>
+                  ))
+                ) : resolvedServers.length > 0 ? (
+                  resolvedServers.map((srv) => {
+                    const isActive = activeServerId === srv.id;
+                    const audioLabel = (srv.note || 'Original audio').replace(/\s*audio$/i, '');
+                    return (
+                      <button
+                        key={`aud-${srv.id}`}
+                        type="button"
+                        onClick={() => void switchToMovyServer(srv.id)}
+                        className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                          isActive
+                            ? 'text-white bg-white/[0.14]'
+                            : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                        }`}
+                      >
+                        <img
+                          src={flagSvgUrl(srv.flagCode)}
+                          alt=""
+                          className="w-4 h-3 rounded-[2px] object-cover flex-shrink-0"
+                        />
+                        <span className="flex-1 min-w-0">
+                          <span className="block truncate">{audioLabel}</span>
+                          <span className="block text-[10px] text-gray-500 truncate">
+                            {srv.name}
+                            {srv.sources[0]?.kind === 'mp4' ? ' · Direct' : ''}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  })
+                ) : (
+                  <div className="flex h-24 items-center justify-center px-3">
+                    <p className="text-center text-xs leading-relaxed text-white/55">
+                      {streamResolving ? 'Loading audio tracks...' : 'Original audio'}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Subtitles Column */}
+            <div className="min-w-[155px] md:min-w-[190px] max-w-[240px] flex flex-col min-h-0 pl-3 md:pl-4">
+              <p className="px-2.5 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
+                Subtitles
+              </p>
+              <div className="flex-1 min-h-0 overflow-y-auto custom-vertical-scroll space-y-0.5 pr-1">
+                <button
+                  type="button"
+                  onClick={() => selectSubtitle(null)}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                    isSubOff || !selectedSub
+                      ? 'text-white bg-white/[0.14]'
+                      : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                  }`}
+                >
+                  <span>Off</span>
+                </button>
+
+                {selectedSub?.type === 'upload' && !isSubOff && (
+                  <button
+                    type="button"
+                    onClick={() => selectSubtitle(selectedSub)}
+                    className="w-full flex flex-col px-3 py-2 rounded-lg text-[13px] font-medium text-left text-white bg-white/[0.14]"
+                  >
+                    <span className="truncate">Uploaded</span>
+                    <span className="text-[11px] text-gray-400 truncate">
+                      {selectedSub.language}
+                    </span>
+                  </button>
+                )}
+
+                {subtitles.map((sub) => (
+                  <button
+                    key={sub.id}
+                    type="button"
+                    onClick={() => selectSubtitle(sub)}
+                    className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                      !isSubOff && selectedSub?.url === sub.url
+                        ? 'text-white bg-white/[0.14]'
+                        : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                    }`}
+                  >
+                    {sub.flagUrl && (
+                      <img
+                        src={sub.flagUrl}
+                        alt=""
+                        className="w-4 h-3 rounded-[2px] object-cover flex-shrink-0"
+                      />
+                    )}
+                    <span className="truncate">{sub.language}</span>
+                  </button>
+                ))}
+
+                {subtitles.length === 0 && selectedSub?.type !== 'upload' && (
+                  <div className="flex items-center justify-center px-3 py-4">
+                    <p className="text-center text-xs leading-relaxed text-white/55">
+                      No subtitles yet
+                    </p>
+                  </div>
+                )}
+
+                {/* Upload .SRT/.VTT */}
+                <div className="group relative mt-1 flex cursor-pointer select-none items-center gap-x-2 rounded-lg border border-dashed border-white/[0.14] bg-white/[0.02] px-3 py-2 text-[12.5px] font-medium text-white/75 transition-colors hover:border-white/30 hover:bg-white/[0.06] hover:text-white">
+                  <input
+                    type="file"
+                    accept=".vtt,.srt"
+                    onChange={handleUploadSubtitle}
+                    className="absolute inset-0 z-10 opacity-0 cursor-pointer"
+                  />
+                  <Upload className="h-3.5 w-3.5 flex-shrink-0 text-white/50 group-hover:text-white/90" />
+                  <span className="truncate">Upload subtitles</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-3 pt-3 border-t border-white/10 space-y-0.5">
+            <button
+              type="button"
+              onClick={() => void openSubtitleSearchView()}
+              className="w-full flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-lg text-[13px] font-medium text-gray-300 hover:text-white hover:bg-white/10 transition-colors text-left"
+            >
+              <span className="flex items-center gap-2.5 whitespace-nowrap">
+                <Search className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                <span>Search OpenSubtitles</span>
+              </span>
+              <ChevronRight className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSubsView('customize')}
+              className="w-full flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-lg text-[13px] font-medium text-gray-300 hover:text-white hover:bg-white/10 transition-colors text-left"
+            >
+              <span className="flex items-center gap-2.5 whitespace-nowrap">
+                <SlidersHorizontal className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                <span>Customize appearance</span>
+              </span>
+              <ChevronRight className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex w-[320px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setSubsView('main')}
+            className="mb-3 self-start flex items-center gap-1.5 h-8 px-3.5 rounded-full border border-white/10 bg-white/[0.03] text-xs font-medium text-white/80 hover:bg-white/[0.08] hover:text-white transition"
+          >
+            <ChevronLeft className="w-3.5 h-3.5" />
+            <span>Back to subtitles</span>
+          </button>
+
+          <div className="custom-vertical-scroll max-h-[min(420px,56vh)] overflow-y-auto overflow-x-hidden pr-1">
+            {subsView === 'opensubs' ? (
+              searchSubsLoading ? (
+                <div className="flex items-center justify-center gap-3 p-8">
+                  <Loader2 className="w-5 h-5 animate-spin text-white/75" />
+                  <span className="text-sm text-white/70">Loading subtitles...</span>
+                </div>
+              ) : searchSubsList.length === 0 ? (
+                <div className="flex items-center justify-center p-8">
+                  <span className="text-sm text-white/60">No subtitles available</span>
+                </div>
+              ) : (
+                <div className="space-y-0.5">
+                  {searchSubsList.map((sub) => (
+                    <button
+                      key={sub.id}
+                      type="button"
+                      onClick={() => selectSubtitle(sub)}
+                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
+                        !isSubOff && selectedSub?.url === sub.url
+                          ? 'text-white bg-white/[0.14]'
+                          : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
+                      }`}
+                    >
+                      {sub.flagUrl && (
+                        <img
+                          src={sub.flagUrl}
+                          alt=""
+                          className="w-5 h-[15px] rounded-[3px] object-cover flex-shrink-0"
+                        />
+                      )}
+                      <span className="flex-1 min-w-0 truncate">{sub.language}</span>
+                    </button>
+                  ))}
+                </div>
+              )
+            ) : (
+              /* Customize Appearance Tab */
+              <div className="space-y-4 py-1">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-[0.12em] text-white/70">
+                      Font Size
+                    </span>
+                    <span className="text-[13px] font-semibold text-white tabular-nums">
+                      {subtitleSettings.fontSize}px
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={16}
+                    max={50}
+                    step={1}
+                    value={subtitleSettings.fontSize}
+                    onChange={(e) =>
+                      updateSubtitleSettings({ fontSize: Number(e.target.value) })
+                    }
+                    className="vp-range w-full"
+                    style={{
+                      background: `linear-gradient(to right, #fff ${
+                        ((subtitleSettings.fontSize - 16) / 34) * 100
+                      }%, rgba(255,255,255,0.14) ${
+                        ((subtitleSettings.fontSize - 16) / 34) * 100
+                      }%)`,
+                    }}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-[0.12em] text-white/70">
+                      Background Opacity
+                    </span>
+                    <span className="text-[13px] font-semibold text-white tabular-nums">
+                      {Math.round(subtitleSettings.backgroundOpacity * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={subtitleSettings.backgroundOpacity}
+                    onChange={(e) =>
+                      updateSubtitleSettings({
+                        backgroundOpacity: Number(e.target.value),
+                      })
+                    }
+                    className="vp-range w-full"
+                    style={{
+                      background: `linear-gradient(to right, #fff ${
+                        subtitleSettings.backgroundOpacity * 100
+                      }%, rgba(255,255,255,0.14) ${
+                        subtitleSettings.backgroundOpacity * 100
+                      }%)`,
+                    }}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <span className="block text-[11px] font-bold uppercase tracking-[0.12em] text-white/70">
+                    Color
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <label
+                      className="relative h-8 w-8 flex-shrink-0 cursor-pointer rounded-full ring-1 ring-inset ring-white/25"
+                      style={{ backgroundColor: subtitleSettings.color }}
+                    >
+                      <input
+                        type="color"
+                        value={subtitleSettings.color}
+                        onChange={(e) =>
+                          updateSubtitleSettings({ color: e.target.value })
+                        }
+                        className="absolute inset-0 cursor-pointer opacity-0"
+                      />
+                    </label>
+                    {['#fcf4f4', '#fde047', '#38bdf8', '#86efac'].map((hex) => (
+                      <button
+                        key={hex}
+                        type="button"
+                        onClick={() => updateSubtitleSettings({ color: hex })}
+                        aria-label={`Subtitle color ${hex}`}
+                        className={`h-7 w-7 rounded-full border transition ${
+                          subtitleSettings.color.toLowerCase() === hex
+                            ? 'border-white scale-110'
+                            : 'border-white/20'
+                        }`}
+                        style={{ backgroundColor: hex }}
+                      />
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <span className="block text-[11px] font-bold uppercase tracking-[0.12em] text-white/70">
+                    Latency
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSubLatency((l) => Number((l - 0.5).toFixed(1)))}
+                      className="h-8 px-3 rounded-full border border-white/10 bg-white/[0.03] text-xs font-medium text-white/80 hover:bg-white/10"
+                    >
+                      -0.5s
+                    </button>
+                    <input
+                      type="number"
+                      step="0.5"
+                      value={subLatency}
+                      onChange={(e) => setSubLatency(Number(e.target.value) || 0)}
+                      className="flex-1 min-w-0 h-8 rounded-full bg-white/[0.04] border border-white/10 text-center text-xs text-white tabular-nums"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setSubLatency((l) => Number((l + 0.5).toFixed(1)))}
+                      className="h-8 px-3 rounded-full border border-white/10 bg-white/[0.03] text-xs font-medium text-white/80 hover:bg-white/10"
+                    >
+                      +0.5s
+                    </button>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSubLatency(0);
+                    updateSubtitleSettings({
+                      fontSize: isTouchDevice ? 23 : 30,
+                      backgroundOpacity: 0.45,
+                      color: '#fcf4f4',
+                    });
+                  }}
+                  className="w-full h-8 rounded-full border border-white/10 bg-white/[0.04] text-xs font-semibold text-white/80 hover:bg-white/10 hover:text-white transition"
+                >
+                  Reset
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div
@@ -1610,24 +2402,66 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
             </div>
           )}
 
-          {/* Double-Tap Seek Feedback */}
+          {/* Double-Tap / Keyboard Streak Seek Feedback */}
           {seekFeedback && (
             <div
-              className={`pointer-events-none absolute top-1/2 -translate-y-1/2 z-20 px-4 py-2.5 rounded-full bg-black/65 backdrop-blur-md text-white text-xs font-bold flex items-center gap-1.5 ${
-                seekFeedback === 'back' ? 'left-[14%]' : 'right-[14%]'
+              key={seekFeedback.key}
+              className={`pointer-events-none absolute top-1/2 -translate-y-1/2 z-20 px-4 py-2.5 rounded-full bg-black/65 backdrop-blur-md text-white text-xs sm:text-sm font-bold flex items-center gap-1.5 shadow-xl ${
+                seekFeedback.side === 'back' ? 'left-[14%]' : 'right-[14%]'
               }`}
             >
-              {seekFeedback === 'back' ? (
+              {seekFeedback.side === 'back' ? (
                 <>
                   <MovyBackward10Svg className="w-5 h-5" />
-                  <span>-10s</span>
+                  <span>-{seekFeedback.seconds}s</span>
                 </>
               ) : (
                 <>
-                  <span>+10s</span>
+                  <span>+{seekFeedback.seconds}s</span>
                   <MovyForward10Svg className="w-5 h-5" />
                 </>
               )}
+            </div>
+          )}
+
+          {/* Top-Center Frosted OSD Indicator (Volume / Mobile Volume Boost / Subtitles Toggle) */}
+          <div
+            aria-live="polite"
+            className={`pointer-events-none absolute top-16 md:top-20 left-1/2 -translate-x-1/2 z-50 bg-white/[0.08] backdrop-blur-2xl px-3.5 py-1.5 rounded-2xl border border-white/15 shadow-2xl flex items-center gap-2 transition-all duration-200 ${
+              osdBadge.show
+                ? 'opacity-100 scale-100 translate-y-0'
+                : 'opacity-0 scale-95 -translate-y-2'
+            }`}
+          >
+            {osdBadge.kind === 'volume' ? (
+              <span style={{ color: osdBadge.color }} className="flex items-center">
+                <MovyVolumeSvg
+                  level={osdBadge.volumeLevel ?? 100}
+                  muted={Boolean(osdBadge.muted)}
+                  className="w-4 h-4 flex-none"
+                />
+              </span>
+            ) : (
+              <MovyCcSvg className="w-4 h-4 flex-none text-white" />
+            )}
+            <span
+              className="text-xs sm:text-sm font-bold tracking-wide tabular-nums"
+              style={{ color: osdBadge.color }}
+            >
+              {osdBadge.text}
+            </span>
+          </div>
+
+          {/* Desktop Center Play/Pause Keyboard Pulse */}
+          {!isTouchDevice && centerPulse && !streamResolving && !buffering && (
+            <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
+              <div className="h-16 w-16 rounded-full bg-white/[0.1] border border-white/15 backdrop-blur-md flex items-center justify-center text-white shadow-2xl transition-all duration-200">
+                {centerPulse === 'play' ? (
+                  <MovyPlaySvg className="w-7 h-7" />
+                ) : (
+                  <MovyPauseSvg className="w-7 h-7" />
+                )}
+              </div>
             </div>
           )}
 
@@ -1671,7 +2505,7 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
                 {loadedData && (!buffering || paused) && !streamResolving ? (
                   <button
                     type="button"
-                    onClick={togglePlayPause}
+                    onClick={() => togglePlayPause()}
                     aria-label={paused ? 'Play' : 'Pause'}
                     className="p-2 rounded-full hover:bg-white/20 active:scale-110 transition text-white"
                   >
@@ -1721,25 +2555,25 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
             </div>
           )}
 
-          {/* TopHeader Bar (Exact Movy Layout + Popovers) */}
+          {/* TopHeader Bar */}
           <div
             style={{
               paddingTop: 'env(safe-area-inset-top)',
-              paddingLeft: 'max(1rem, env(safe-area-inset-left))',
-              paddingRight: 'max(1rem, env(safe-area-inset-right))',
+              paddingLeft: 'max(0.75rem, env(safe-area-inset-left))',
+              paddingRight: 'max(0.75rem, env(safe-area-inset-right))',
             }}
             onPointerEnter={() => setIsPointerOverUI(true)}
             onPointerLeave={() => setIsPointerOverUI(false)}
             onTouchStart={() => showControls()}
             aria-hidden={!controlsVisible}
-            className={`absolute top-0 left-0 right-0 z-40 flex items-center justify-between h-[68px] md:h-20 lg:h-24 md:px-10 gap-x-3 md:gap-x-6 bg-gradient-to-b from-black/80 via-black/40 to-transparent transition-[opacity,transform] duration-300 ${
+            className={`absolute top-0 left-0 right-0 z-40 flex items-center justify-between h-[64px] md:h-20 lg:h-24 md:px-10 gap-x-2 md:gap-x-6 bg-gradient-to-b from-black/80 via-black/40 to-transparent transition-[opacity,transform] duration-300 ${
               controlsVisible
                 ? 'opacity-100 translate-y-0 pointer-events-auto'
                 : 'opacity-0 -translate-y-2 pointer-events-none'
             }`}
           >
             {/* Left: Back Arrow + Title + Subtitle */}
-            <div className="flex items-center flex-1 min-w-0 gap-x-3 md:gap-x-5">
+            <div className="flex items-center flex-1 min-w-0 gap-x-2.5 md:gap-x-5">
               <button
                 type="button"
                 onClick={onClose}
@@ -1750,714 +2584,187 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
               </button>
 
               <div className="min-w-0">
-                <h1 className="text-white font-bold text-base md:text-xl leading-tight tracking-wide truncate drop-shadow-md">
+                <h1 className="text-white font-bold text-sm sm:text-base md:text-xl leading-tight tracking-wide truncate drop-shadow-md">
                   {detailItem.title}
                 </h1>
                 {headerSubtitle && (
-                  <p className="text-white/70 font-medium text-xs md:text-sm mt-0.5 truncate drop-shadow-md">
+                  <p className="text-white/70 font-medium text-[11px] sm:text-xs md:text-sm mt-0.5 truncate drop-shadow-md">
                     {headerSubtitle}
                   </p>
                 )}
               </div>
             </div>
 
-            {/* Right Controls: Quality/Servers, Audio/Subtitles, Episodes, Next, Download */}
-            <div className="flex items-center gap-1 md:gap-2 flex-shrink-0">
-              {/* Quality & Server Popover */}
-              <div
-                ref={qualityPopoverRef}
-                className="relative"
-                onPointerEnter={(e) => e.pointerType === 'mouse' && hoverMenuOpen('quality')}
-                onPointerLeave={(e) => e.pointerType === 'mouse' && hoverMenuLeave()}
-              >
+            {/* Right Top Controls Pill */}
+            {isTouchDevice ? (
+              /* Mobile Top-Right Frosted Pill: [Episodes? | Next Ep? | CC | Volume Boost | Quality] */
+              <div className={`${PILL_GROUP_CLASS} px-1.5 py-1 gap-0.5 flex-shrink-0`}>
+                {(item.mediaType === 'tv' || item.mediaType === 'anime') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      setEpisodesDrawerOpen((p) => !p);
+                    }}
+                    className={PILL_ICON_BTN_CLASS}
+                    aria-label="Episodes"
+                    title="Episodes"
+                  >
+                    <ListVideo className="w-4 h-4 flex-shrink-0" />
+                  </button>
+                )}
+
+                {nextEpisode && (
+                  <button
+                    type="button"
+                    onClick={() => setCurrentEpisode(nextEpisode)}
+                    className={PILL_ICON_BTN_CLASS}
+                    aria-label="Next Episode"
+                    title="Next Episode"
+                  >
+                    <SkipForward className="w-4 h-4 flex-shrink-0" />
+                  </button>
+                )}
+
+                {/* Audio & Subtitles (Mobile) */}
+                <div ref={subsPopoverRef} className="relative">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSubsView('main');
+                      setOpenMenu((m) => (m === 'subs' ? null : 'subs'));
+                    }}
+                    className={PILL_ICON_BTN_CLASS}
+                    aria-label="Audio and Subtitles"
+                    title="Audio & Subtitles"
+                  >
+                    <MovyCcSvg className="w-4 h-4 flex-shrink-0" />
+                  </button>
+
+                  {openMenu === 'subs' && (
+                    <div className="fixed left-1/2 top-[68px] z-50 -translate-x-1/2 max-w-[calc(100vw-0.75rem)]">
+                      {renderSubsPopoverPanel()}
+                    </div>
+                  )}
+                </div>
+
+                {/* Mobile-Only Volume Booster (Off -> +25% Orange -> +50% Red -> Off) */}
                 <button
                   type="button"
-                  onClick={() => setOpenMenu((m) => (m === 'quality' ? null : 'quality'))}
-                  className={TOP_BAR_BTN_CLASS}
-                  aria-label="Quality and Servers"
+                  onClick={toggleMobileVolumeBoost}
+                  className={PILL_ICON_BTN_CLASS}
+                  style={{
+                    color:
+                      mobileBoostLevel === 2
+                        ? '#ef4444'
+                        : mobileBoostLevel === 1
+                          ? '#f97316'
+                          : undefined,
+                  }}
+                  aria-label={
+                    mobileBoostLevel === 0
+                      ? 'Volume Boost Off'
+                      : mobileBoostLevel === 1
+                        ? 'Volume Boost +25%'
+                        : 'Volume Boost +50%'
+                  }
+                  title={
+                    mobileBoostLevel === 0
+                      ? 'Volume Boost (Off)'
+                      : mobileBoostLevel === 1
+                        ? 'Volume Boost (+25%)'
+                        : 'Volume Boost (+50%)'
+                  }
                 >
-                  <MovyQualitySvg className="w-6 h-6 flex-shrink-0" />
-                  <span className="hidden md:inline">Quality</span>
-                  {activeQualityText && (
-                    <span className="hidden md:inline opacity-55 font-normal">
-                      {activeQualityText}
+                  <MovyVolumeSvg
+                    level={mobileBoostLevel === 2 ? 100 : mobileBoostLevel === 1 ? 80 : volume}
+                    muted={mobileBoostLevel === 0 && isMuted}
+                    className="w-4 h-4 flex-shrink-0"
+                  />
+                </button>
+
+                {/* Quality & Servers (Mobile) */}
+                <div ref={qualityPopoverRef} className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setOpenMenu((m) => (m === 'quality' ? null : 'quality'))}
+                    className={PILL_ICON_BTN_CLASS}
+                    aria-label="Quality and Servers"
+                    title="Quality & Servers"
+                  >
+                    <MovyQualitySvg className="w-4 h-4 flex-shrink-0" />
+                  </button>
+
+                  {openMenu === 'quality' && (
+                    <div className="fixed left-1/2 top-[68px] z-50 -translate-x-1/2 max-w-[calc(100vw-0.75rem)]">
+                      {renderQualityPopoverPanel()}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              /* Desktop Top-Right Frosted Pill: [Episodes? | Watchlist | Download] */
+              <div className={`${PILL_GROUP_CLASS} px-2 py-1 gap-0.5 flex-shrink-0`}>
+                {(item.mediaType === 'tv' || item.mediaType === 'anime') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      setEpisodesDrawerOpen((p) => !p);
+                    }}
+                    className={PILL_ICON_BTN_CLASS}
+                    aria-label="Episodes"
+                  >
+                    <ListVideo className="w-4 h-4 flex-shrink-0" />
+                    <span className="hidden lg:inline">Episodes</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => onToggleWatchlist(detailItem)}
+                  aria-label={inWatchlist ? 'Remove from Watchlist' : 'Add to Watchlist'}
+                  title={inWatchlist ? 'In Watchlist' : 'Add to Watchlist'}
+                  className={`${PILL_ICON_BTN_CLASS} ${
+                    inWatchlist ? '!text-[#ff4651]' : ''
+                  }`}
+                >
+                  {inWatchlist ? (
+                    <Check className="w-4 h-4 flex-shrink-0" />
+                  ) : (
+                    <Bookmark className="w-4 h-4 flex-shrink-0" />
+                  )}
+                  <span className="hidden xl:inline">
+                    {inWatchlist ? 'Saved' : 'Watchlist'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    onOpenDownload({
+                      item: detailItem,
+                      seasonNumber,
+                      episode: currentEpisode,
+                      animeAudio,
+                    })
+                  }
+                  aria-label="Download"
+                  className={PILL_ICON_BTN_CLASS}
+                >
+                  <Download className="w-4 h-4 flex-shrink-0" />
+                  <span className="hidden lg:inline">Download</span>
+                  {activeDownloads.length > 0 && (
+                    <span className="px-1.5 py-0.5 rounded-full bg-[#e50914] text-[10px] font-bold text-white tabular-nums">
+                      {overallProgress}%
                     </span>
                   )}
                 </button>
-
-                {openMenu === 'quality' && (
-                  <div className="fixed left-1/2 top-[72px] z-50 -translate-x-1/2 max-w-[calc(100vw-0.75rem)] md:absolute md:left-auto md:right-0 md:top-full md:max-w-none md:translate-x-0 md:pt-2">
-                    <div className="player-surface rounded-xl p-4 shadow-2xl overflow-x-hidden">
-                      <div className="flex divide-x divide-white/10 max-h-[min(400px,58vh)]">
-                        {/* Quality Column */}
-                        <div className="min-w-[130px] md:min-w-[160px] max-w-[210px] flex flex-col min-h-0 pr-3 md:pr-4">
-                          <p className="px-2.5 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
-                            Quality
-                          </p>
-                          <div className="flex-1 min-h-0 overflow-y-auto custom-vertical-scroll space-y-0.5 pr-1">
-                            {streamResolving && sources.length === 0 ? (
-                              <div className="flex h-24 items-center justify-center px-3">
-                                <p className="text-center text-xs text-white/60">
-                                  Finding best server...
-                                </p>
-                              </div>
-                            ) : hlsQualities.length > 0 ? (
-                              hlsQualities.map((q) => (
-                                <button
-                                  key={q.levelIndex}
-                                  type="button"
-                                  onClick={() => {
-                                    setSelectedHlsLevel(q.levelIndex);
-                                    if (hlsRef.current) {
-                                      hlsRef.current.currentLevel = q.levelIndex;
-                                    }
-                                  }}
-                                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                    selectedHlsLevel === q.levelIndex
-                                      ? 'text-white bg-white/[0.14]'
-                                      : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                  }`}
-                                >
-                                  <span className="flex-1 min-w-0">
-                                    <span className="block truncate">{q.label}</span>
-                                    {q.caption && (
-                                      <span className="block text-[11px] font-normal text-gray-500 mt-0.5">
-                                        {q.caption}
-                                      </span>
-                                    )}
-                                  </span>
-                                </button>
-                              ))
-                            ) : sources.length > 0 ? (
-                              sources.map((src, idx) => (
-                                <button
-                                  key={src.id}
-                                  type="button"
-                                  onClick={() => setSelectedSourceIdx(idx)}
-                                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                    idx === selectedSourceIdx
-                                      ? 'text-white bg-white/[0.14]'
-                                      : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                  }`}
-                                >
-                                  <span className="flex-1 min-w-0">
-                                    <span className="block truncate">{src.quality}</span>
-                                    {qualityCaption(src.quality) && (
-                                      <span className="block text-[11px] font-normal text-gray-500 mt-0.5">
-                                        {qualityCaption(src.quality)}
-                                      </span>
-                                    )}
-                                  </span>
-                                </button>
-                              ))
-                            ) : (
-                              <div className="flex h-20 items-center justify-center px-3">
-                                <p className="text-center text-xs text-white/55">
-                                  No stream loaded
-                                </p>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Server Column (All 18 Movy Nodes OR Anime Audio/Nodes) */}
-                        <div className="min-w-[165px] md:min-w-[205px] max-w-[250px] flex flex-col min-h-0 pl-3 md:pl-4">
-                          <p className="px-2.5 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
-                            Server
-                          </p>
-                          <div className="flex-1 min-h-0 overflow-y-auto custom-vertical-scroll space-y-0.5 pr-1">
-                            {item.mediaType === 'anime' ? (
-                              <>
-                                <div className="grid grid-cols-2 gap-1 p-1 mb-1 rounded-lg bg-white/[0.05]">
-                                  {(['sub', 'dub'] as const).map((aud) => (
-                                    <button
-                                      key={aud}
-                                      type="button"
-                                      onClick={() => setAnimeAudio(aud)}
-                                      className={`h-7 rounded-md text-[11px] font-bold uppercase transition ${
-                                        animeAudio === aud
-                                          ? 'bg-white text-black'
-                                          : 'text-gray-300 hover:text-white'
-                                      }`}
-                                    >
-                                      {aud}
-                                    </button>
-                                  ))}
-                                </div>
-                                {sources.map((src, idx) => (
-                                  <button
-                                    key={src.id}
-                                    type="button"
-                                    onClick={() => setSelectedSourceIdx(idx)}
-                                    className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                      idx === selectedSourceIdx
-                                        ? 'text-white bg-white/[0.14]'
-                                        : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                    }`}
-                                  >
-                                    <span className="flex-1 truncate">
-                                      {src.serverName || src.label}
-                                    </span>
-                                  </button>
-                                ))}
-                              </>
-                            ) : (
-                              (resolvedServers.length > 0 ? resolvedServers : MOVY_SERVERS).map((srv) => {
-                                const status = serverStatuses[srv.id] || 'idle';
-                                const isActive = activeServerId === srv.id;
-                                const isFav = favoriteServer === srv.tag;
-                                return (
-                                  <button
-                                    key={srv.id}
-                                    type="button"
-                                    onClick={() => void switchToMovyServer(srv.id)}
-                                    className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                      isActive
-                                        ? 'text-white bg-white/[0.14]'
-                                        : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                    }`}
-                                  >
-                                    <img
-                                      src={flagSvgUrl(srv.flagCode)}
-                                      alt={srv.name}
-                                      className="w-5 h-[15px] rounded-[3px] object-cover flex-shrink-0"
-                                    />
-                                    <span className="flex-1 min-w-0">
-                                      <span className="block truncate">{srv.name}</span>
-                                      {srv.note && (
-                                        <span className="block text-[10px] text-gray-500 truncate">
-                                          {srv.note}
-                                        </span>
-                                      )}
-                                    </span>
-                                    {status === 'loading' ? (
-                                      <Loader2 size={13} className="animate-spin text-gray-400 flex-shrink-0" />
-                                    ) : status === 'error' ? (
-                                      <AlertCircle size={13} className="text-red-400 flex-shrink-0" />
-                                    ) : null}
-                                    <span
-                                      role="button"
-                                      tabIndex={0}
-                                      aria-label={`Favorite ${srv.name}`}
-                                      onClick={(ev) => toggleFavoriteServer(ev, srv.tag)}
-                                      onKeyDown={(ev) => {
-                                        if (ev.key === 'Enter' || ev.key === ' ') {
-                                          toggleFavoriteServer(ev, srv.tag);
-                                        }
-                                      }}
-                                      className="p-1 -m-0.5 rounded-md text-gray-500 hover:text-red-400 hover:bg-white/10 transition-colors flex-shrink-0 cursor-pointer"
-                                    >
-                                      <Heart
-                                        width={13}
-                                        height={13}
-                                        fill={isFav ? 'rgb(239,68,68)' : 'none'}
-                                        stroke={isFav ? 'rgb(239,68,68)' : 'currentColor'}
-                                      />
-                                    </span>
-                                  </button>
-                                );
-                              })
-                            )}
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Speed Row */}
-                      <div className="mt-3 flex items-center gap-2 border-t border-white/10 pt-3">
-                        <span className="px-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
-                          Speed
-                        </span>
-                        <div className="flex flex-1 items-center gap-1">
-                          {SPEED_OPTIONS.map((spd) => (
-                            <button
-                              key={spd}
-                              type="button"
-                              onClick={() => setPlaybackSpeed(spd)}
-                              className={`flex-1 rounded-full px-1.5 py-1.5 text-[11.5px] font-semibold tabular-nums transition-colors ${
-                                playbackSpeed === spd
-                                  ? 'bg-white text-black'
-                                  : 'text-gray-400 hover:bg-white/10 hover:text-white'
-                              }`}
-                            >
-                              {spd}x
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
               </div>
-
-              {/* Audio & Subtitles Popover */}
-              <div
-                ref={subsPopoverRef}
-                className="relative"
-                onPointerEnter={(e) => e.pointerType === 'mouse' && hoverMenuOpen('subs')}
-                onPointerLeave={(e) => e.pointerType === 'mouse' && hoverMenuLeave()}
-              >
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSubsView('main');
-                    setOpenMenu((m) => (m === 'subs' ? null : 'subs'));
-                  }}
-                  className={TOP_BAR_BTN_CLASS}
-                  aria-label="Audio and Subtitles"
-                >
-                  <MovyCcSvg className="w-6 h-6 flex-shrink-0" />
-                  <span className="hidden md:inline">Audio &amp; Subtitles</span>
-                </button>
-
-                {openMenu === 'subs' && (
-                  <div className="fixed left-1/2 top-[72px] z-50 -translate-x-1/2 max-w-[calc(100vw-0.75rem)] md:absolute md:left-auto md:right-0 md:top-full md:max-w-none md:translate-x-0 md:pt-2">
-                    <div className="player-surface rounded-xl p-4 shadow-2xl overflow-x-hidden">
-                      {subsView === 'main' ? (
-                        <div className="flex flex-col">
-                          <div className="flex divide-x divide-white/10 max-h-[min(360px,50vh)]">
-                            {/* Audios Column */}
-                            <div className="min-w-[145px] md:min-w-[180px] max-w-[230px] flex flex-col min-h-0 pr-3 md:pr-4">
-                              <p className="px-2.5 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
-                                Audios
-                              </p>
-                              <div className="flex-1 min-h-0 overflow-y-auto custom-vertical-scroll space-y-0.5 pr-1">
-                                {hlsAudios.length > 0 ? (
-                                  hlsAudios.map((aud) => (
-                                    <button
-                                      key={aud.index}
-                                      type="button"
-                                      onClick={() => {
-                                        setSelectedHlsAudio(aud.index);
-                                        if (hlsRef.current) hlsRef.current.audioTrack = aud.index;
-                                      }}
-                                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                        selectedHlsAudio === aud.index
-                                          ? 'text-white bg-white/[0.14]'
-                                          : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                      }`}
-                                    >
-                                      <span className="truncate">{aud.name}</span>
-                                    </button>
-                                  ))
-                                ) : item.mediaType === 'anime' ? (
-                                  ([
-                                    { id: 'sub', label: 'Japanese (Sub)' },
-                                    { id: 'dub', label: 'English (Dub)' },
-                                  ] as const).map((opt) => (
-                                    <button
-                                      key={opt.id}
-                                      type="button"
-                                      onClick={() => setAnimeAudio(opt.id)}
-                                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                        animeAudio === opt.id
-                                          ? 'text-white bg-white/[0.14]'
-                                          : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                      }`}
-                                    >
-                                      <span className="truncate">{opt.label}</span>
-                                    </button>
-                                  ))
-                                ) : resolvedServers.length > 0 ? (
-                                  resolvedServers.map((srv) => {
-                                    const isActive = activeServerId === srv.id;
-                                    const audioLabel = (srv.note || 'Original audio').replace(
-                                      /\s*audio$/i,
-                                      '',
-                                    );
-                                    return (
-                                      <button
-                                        key={`aud-${srv.id}`}
-                                        type="button"
-                                        onClick={() => void switchToMovyServer(srv.id)}
-                                        className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                          isActive
-                                            ? 'text-white bg-white/[0.14]'
-                                            : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                        }`}
-                                      >
-                                        <img
-                                          src={flagSvgUrl(srv.flagCode)}
-                                          alt=""
-                                          className="w-4 h-3 rounded-[2px] object-cover flex-shrink-0"
-                                        />
-                                        <span className="flex-1 min-w-0">
-                                          <span className="block truncate">{audioLabel}</span>
-                                          <span className="block text-[10px] text-gray-500 truncate">
-                                            {srv.name}
-                                            {srv.sources[0]?.kind === 'mp4' ? ' · Direct' : ''}
-                                          </span>
-                                        </span>
-                                      </button>
-                                    );
-                                  })
-                                ) : (
-                                  <div className="flex h-24 items-center justify-center px-3">
-                                    <p className="text-center text-xs leading-relaxed text-white/55">
-                                      {streamResolving ? 'Loading audio tracks...' : 'Original audio'}
-                                    </p>
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-
-                            {/* Subtitles Column */}
-                            <div className="min-w-[155px] md:min-w-[190px] max-w-[240px] flex flex-col min-h-0 pl-3 md:pl-4">
-                              <p className="px-2.5 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-gray-500 flex-shrink-0">
-                                Subtitles
-                              </p>
-                              <div className="flex-1 min-h-0 overflow-y-auto custom-vertical-scroll space-y-0.5 pr-1">
-                                <button
-                                  type="button"
-                                  onClick={() => selectSubtitle(null)}
-                                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                    isSubOff || !selectedSub
-                                      ? 'text-white bg-white/[0.14]'
-                                      : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                  }`}
-                                >
-                                  <span>Off</span>
-                                </button>
-
-                                {selectedSub?.type === 'upload' && !isSubOff && (
-                                  <button
-                                    type="button"
-                                    onClick={() => selectSubtitle(selectedSub)}
-                                    className="w-full flex flex-col px-3 py-2 rounded-lg text-[13px] font-medium text-left text-white bg-white/[0.14]"
-                                  >
-                                    <span className="truncate">Uploaded</span>
-                                    <span className="text-[11px] text-gray-400 truncate">
-                                      {selectedSub.language}
-                                    </span>
-                                  </button>
-                                )}
-
-                                {subtitles.map((sub) => (
-                                  <button
-                                    key={sub.id}
-                                    type="button"
-                                    onClick={() => selectSubtitle(sub)}
-                                    className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                      !isSubOff && selectedSub?.url === sub.url
-                                        ? 'text-white bg-white/[0.14]'
-                                        : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                    }`}
-                                  >
-                                    {sub.flagUrl && (
-                                      <img
-                                        src={sub.flagUrl}
-                                        alt=""
-                                        className="w-4 h-3 rounded-[2px] object-cover flex-shrink-0"
-                                      />
-                                    )}
-                                    <span className="truncate">{sub.language}</span>
-                                  </button>
-                                ))}
-
-                                {subtitles.length === 0 && selectedSub?.type !== 'upload' && (
-                                  <div className="flex items-center justify-center px-3 py-4">
-                                    <p className="text-center text-xs leading-relaxed text-white/55">
-                                      No subtitles yet
-                                    </p>
-                                  </div>
-                                )}
-
-                                {/* Upload .SRT/.VTT */}
-                                <div className="group relative mt-1 flex cursor-pointer select-none items-center gap-x-2 rounded-lg border border-dashed border-white/[0.14] bg-white/[0.02] px-3 py-2 text-[12.5px] font-medium text-white/75 transition-colors hover:border-white/30 hover:bg-white/[0.06] hover:text-white">
-                                  <input
-                                    type="file"
-                                    accept=".vtt,.srt"
-                                    onChange={handleUploadSubtitle}
-                                    className="absolute inset-0 z-10 opacity-0 cursor-pointer"
-                                  />
-                                  <Upload className="h-3.5 w-3.5 flex-shrink-0 text-white/50 group-hover:text-white/90" />
-                                  <span className="truncate">Upload subtitles</span>
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="mt-3 pt-3 border-t border-white/10 space-y-0.5">
-                            <button
-                              type="button"
-                              onClick={() => void openSubtitleSearchView()}
-                              className="w-full flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-lg text-[13px] font-medium text-gray-300 hover:text-white hover:bg-white/10 transition-colors text-left"
-                            >
-                              <span className="flex items-center gap-2.5 whitespace-nowrap">
-                                <Search className="w-4 h-4 text-gray-400 flex-shrink-0" />
-                                <span>Search OpenSubtitles</span>
-                              </span>
-                              <ChevronRight className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
-                            </button>
-
-                            <button
-                              type="button"
-                              onClick={() => setSubsView('customize')}
-                              className="w-full flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-lg text-[13px] font-medium text-gray-300 hover:text-white hover:bg-white/10 transition-colors text-left"
-                            >
-                              <span className="flex items-center gap-2.5 whitespace-nowrap">
-                                <SlidersHorizontal className="w-4 h-4 text-gray-400 flex-shrink-0" />
-                                <span>Customize appearance</span>
-                              </span>
-                              <ChevronRight className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="flex w-[320px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden">
-                          <button
-                            type="button"
-                            onClick={() => setSubsView('main')}
-                            className="mb-3 self-start flex items-center gap-1.5 h-8 px-3.5 rounded-full border border-white/10 bg-white/[0.03] text-xs font-medium text-white/80 hover:bg-white/[0.08] hover:text-white transition"
-                          >
-                            <ChevronLeft className="w-3.5 h-3.5" />
-                            <span>Back to subtitles</span>
-                          </button>
-
-                          <div className="custom-vertical-scroll max-h-[min(420px,56vh)] overflow-y-auto overflow-x-hidden pr-1">
-                            {subsView === 'opensubs' ? (
-                              searchSubsLoading ? (
-                                <div className="flex items-center justify-center gap-3 p-8">
-                                  <Loader2 className="w-5 h-5 animate-spin text-white/75" />
-                                  <span className="text-sm text-white/70">Loading subtitles...</span>
-                                </div>
-                              ) : searchSubsList.length === 0 ? (
-                                <div className="flex items-center justify-center p-8">
-                                  <span className="text-sm text-white/60">No subtitles available</span>
-                                </div>
-                              ) : (
-                                <div className="space-y-0.5">
-                                  {searchSubsList.map((sub) => (
-                                    <button
-                                      key={sub.id}
-                                      type="button"
-                                      onClick={() => selectSubtitle(sub)}
-                                      className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium text-left transition-colors ${
-                                        !isSubOff && selectedSub?.url === sub.url
-                                          ? 'text-white bg-white/[0.14]'
-                                          : 'text-gray-300 hover:text-white hover:bg-white/[0.08]'
-                                      }`}
-                                    >
-                                      {sub.flagUrl && (
-                                        <img
-                                          src={sub.flagUrl}
-                                          alt=""
-                                          className="w-5 h-[15px] rounded-[3px] object-cover flex-shrink-0"
-                                        />
-                                      )}
-                                      <span className="flex-1 min-w-0 truncate">{sub.language}</span>
-                                    </button>
-                                  ))}
-                                </div>
-                              )
-                            ) : (
-                              /* Customize Appearance Tab */
-                              <div className="space-y-4 py-1">
-                                <div className="space-y-2">
-                                  <div className="flex items-center justify-between">
-                                    <span className="text-[11px] font-bold uppercase tracking-[0.12em] text-white/70">
-                                      Font Size
-                                    </span>
-                                    <span className="text-[13px] font-semibold text-white tabular-nums">
-                                      {subtitleSettings.fontSize}px
-                                    </span>
-                                  </div>
-                                  <input
-                                    type="range"
-                                    min={16}
-                                    max={50}
-                                    step={1}
-                                    value={subtitleSettings.fontSize}
-                                    onChange={(e) =>
-                                      updateSubtitleSettings({ fontSize: Number(e.target.value) })
-                                    }
-                                    className="vp-range w-full"
-                                    style={{
-                                      background: `linear-gradient(to right, #fff ${
-                                        ((subtitleSettings.fontSize - 16) / 34) * 100
-                                      }%, rgba(255,255,255,0.14) ${
-                                        ((subtitleSettings.fontSize - 16) / 34) * 100
-                                      }%)`,
-                                    }}
-                                  />
-                                </div>
-
-                                <div className="space-y-2">
-                                  <div className="flex items-center justify-between">
-                                    <span className="text-[11px] font-bold uppercase tracking-[0.12em] text-white/70">
-                                      Background Opacity
-                                    </span>
-                                    <span className="text-[13px] font-semibold text-white tabular-nums">
-                                      {Math.round(subtitleSettings.backgroundOpacity * 100)}%
-                                    </span>
-                                  </div>
-                                  <input
-                                    type="range"
-                                    min={0}
-                                    max={1}
-                                    step={0.05}
-                                    value={subtitleSettings.backgroundOpacity}
-                                    onChange={(e) =>
-                                      updateSubtitleSettings({
-                                        backgroundOpacity: Number(e.target.value),
-                                      })
-                                    }
-                                    className="vp-range w-full"
-                                    style={{
-                                      background: `linear-gradient(to right, #fff ${
-                                        subtitleSettings.backgroundOpacity * 100
-                                      }%, rgba(255,255,255,0.14) ${
-                                        subtitleSettings.backgroundOpacity * 100
-                                      }%)`,
-                                    }}
-                                  />
-                                </div>
-
-                                <div className="space-y-2">
-                                  <span className="block text-[11px] font-bold uppercase tracking-[0.12em] text-white/70">
-                                    Color
-                                  </span>
-                                  <div className="flex items-center gap-2">
-                                    <label
-                                      className="relative h-8 w-8 flex-shrink-0 cursor-pointer rounded-full ring-1 ring-inset ring-white/25"
-                                      style={{ backgroundColor: subtitleSettings.color }}
-                                    >
-                                      <input
-                                        type="color"
-                                        value={subtitleSettings.color}
-                                        onChange={(e) =>
-                                          updateSubtitleSettings({ color: e.target.value })
-                                        }
-                                        className="absolute inset-0 cursor-pointer opacity-0"
-                                      />
-                                    </label>
-                                    {['#fcf4f4', '#fde047', '#38bdf8', '#86efac'].map((hex) => (
-                                      <button
-                                        key={hex}
-                                        type="button"
-                                        onClick={() => updateSubtitleSettings({ color: hex })}
-                                        aria-label={`Subtitle color ${hex}`}
-                                        className={`h-7 w-7 rounded-full border transition ${
-                                          subtitleSettings.color.toLowerCase() === hex
-                                            ? 'border-white scale-110'
-                                            : 'border-white/20'
-                                        }`}
-                                        style={{ backgroundColor: hex }}
-                                      />
-                                    ))}
-                                  </div>
-                                </div>
-
-                                <div className="space-y-2">
-                                  <span className="block text-[11px] font-bold uppercase tracking-[0.12em] text-white/70">
-                                    Latency
-                                  </span>
-                                  <div className="flex items-center gap-2">
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setSubLatency((l) => Number((l - 0.5).toFixed(1)))
-                                      }
-                                      className="h-8 px-3 rounded-full border border-white/10 bg-white/[0.03] text-xs font-medium text-white/80 hover:bg-white/10"
-                                    >
-                                      -0.5s
-                                    </button>
-                                    <input
-                                      type="number"
-                                      step="0.5"
-                                      value={subLatency}
-                                      onChange={(e) => setSubLatency(Number(e.target.value) || 0)}
-                                      className="flex-1 min-w-0 h-8 rounded-full bg-white/[0.04] border border-white/10 text-center text-xs text-white tabular-nums"
-                                    />
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        setSubLatency((l) => Number((l + 0.5).toFixed(1)))
-                                      }
-                                      className="h-8 px-3 rounded-full border border-white/10 bg-white/[0.03] text-xs font-medium text-white/80 hover:bg-white/10"
-                                    >
-                                      +0.5s
-                                    </button>
-                                  </div>
-                                </div>
-
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setSubLatency(0);
-                                    updateSubtitleSettings({
-                                      fontSize: isTouchDevice ? 23 : 30,
-                                      backgroundOpacity: 0.45,
-                                      color: '#fcf4f4',
-                                    });
-                                  }}
-                                  className="w-full h-8 rounded-full border border-white/10 bg-white/[0.04] text-xs font-semibold text-white/80 hover:bg-white/10 hover:text-white transition"
-                                >
-                                  Reset
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Episodes Drawer Trigger (TV / Anime) */}
-              {(item.mediaType === 'tv' || item.mediaType === 'anime') && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setOpenMenu(null);
-                    setEpisodesDrawerOpen((p) => !p);
-                  }}
-                  className={TOP_BAR_BTN_CLASS}
-                  aria-label="Episodes"
-                >
-                  <ListVideo className="w-5 h-5 flex-shrink-0" />
-                  <span className="hidden md:inline">Episodes</span>
-                </button>
-              )}
-
-              {/* Next Episode Button */}
-              {nextEpisode && (
-                <button
-                  type="button"
-                  onClick={() => setCurrentEpisode(nextEpisode)}
-                  className="tabbable hidden sm:inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white text-black hover:bg-white/85 text-xs font-bold transition whitespace-nowrap shrink-0"
-                >
-                  <span>Next Ep</span>
-                  <ChevronRight className="w-3.5 h-3.5" />
-                </button>
-              )}
-
-              {/* Download Button */}
-              <button
-                type="button"
-                onClick={() =>
-                  onOpenDownload({
-                    item: detailItem,
-                    seasonNumber,
-                    episode: currentEpisode,
-                    animeAudio,
-                  })
-                }
-                aria-label="Download"
-                className={TOP_BAR_BTN_CLASS}
-              >
-                <Download className="w-5 h-5 flex-shrink-0" />
-                <span className="hidden lg:inline">Download</span>
-                {activeDownloads.length > 0 && (
-                  <span className="px-1.5 py-0.5 rounded-full bg-[#e50914] text-[10px] font-bold text-white tabular-nums">
-                    {overallProgress}%
-                  </span>
-                )}
-              </button>
-            </div>
+            )}
           </div>
 
-          {/* Bottom Controls Layer (Exact Movy ControlsLayerMemo) */}
+          {/* Bottom Controls Layer */}
           <div
             onPointerEnter={() => setIsPointerOverUI(true)}
             onPointerLeave={() => setIsPointerOverUI(false)}
@@ -2471,19 +2778,23 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
                 paddingLeft: 'max(0rem, env(safe-area-inset-left))',
                 paddingRight: 'max(0rem, env(safe-area-inset-right))',
               }}
-              className={`w-full flex flex-col items-stretch pt-6 bg-gradient-to-t from-black/80 via-black/40 to-transparent transition-[opacity,transform] duration-300 ${
+              className={`w-full flex flex-col items-stretch pt-6 bg-gradient-to-t from-black/85 via-black/45 to-transparent transition-[opacity,transform] duration-300 ${
                 controlsVisible
                   ? 'opacity-100 translate-y-0 pointer-events-auto'
                   : 'opacity-0 translate-y-2 pointer-events-none'
               }`}
             >
               <div
-                className={`vp-controls-inner px-4 sm:px-6 md:px-10 ${
+                className={`vp-controls-inner px-3 sm:px-6 md:px-10 ${
                   isTouchDevice ? 'is-mobile-chrome' : ''
                 }`}
               >
-                {/* Interactive Seek Bar */}
-                <div className="vp-seek-row flex items-center">
+                {/* Interactive Seek Bar Row: [currentTime] [SeekBar] [duration] [Mobile Fullscreen] */}
+                <div className="vp-seek-row flex items-center gap-2 sm:gap-3">
+                  <span className="vp-controls-time text-[11px] sm:text-xs md:text-sm font-medium text-white/90 tabular-nums flex-none !pl-0">
+                    {formatClock(currentTime)}
+                  </span>
+
                   <div
                     ref={seekBarRef}
                     onMouseDown={(e) => startSeekDrag(e.clientX)}
@@ -2495,7 +2806,7 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
                       if (res) setSeekPreview({ time: Math.round(res.time), offsetPx: res.offsetPx });
                     }}
                     onMouseLeave={() => !isSeeking && setSeekPreview(null)}
-                    className="relative w-full h-5 flex items-center cursor-pointer group"
+                    className="relative flex-1 min-w-0 h-5 flex items-center cursor-pointer group"
                   >
                     {seekPreview && (
                       <div
@@ -2520,133 +2831,260 @@ export const VideoPlayerView: React.FC<VideoPlayerViewProps> = ({
                       </div>
                     </div>
                   </div>
-                </div>
 
-                {/* Controls Row */}
-                <div className="relative mt-2 md:mt-3 flex w-full items-center justify-between">
-                  {/* Left Controls */}
-                  <div className="flex min-w-0 items-center space-x-2 md:space-x-3">
-                    {isTouchDevice ? (
-                      <span className="vp-controls-time text-xs font-medium text-white/90 tabular-nums">
-                        {formatClock(currentTime)} / {formatClock(duration)}
-                      </span>
-                    ) : (
-                      <>
-                        <button
-                          id="ButtonPlay"
-                          type="button"
-                          onClick={togglePlayPause}
-                          aria-label={paused ? 'Play (k)' : 'Pause (k)'}
-                          className="tabbable p-2 rounded-full hover:bg-white/20 transition-transform duration-100 flex items-center active:scale-110"
-                        >
-                          <span className="text-2xl flex items-center justify-center w-[1em] h-[1em]">
-                            {paused ? (
-                              <MovyPlaySvg className="w-[0.8em] h-[0.8em]" />
-                            ) : (
-                              <MovyPauseSvg className="w-[0.8em] h-[0.8em]" />
-                            )}
-                          </span>
-                        </button>
+                  <span className="text-[11px] sm:text-xs md:text-sm font-medium text-white/75 tabular-nums flex-none">
+                    {formatClock(duration)}
+                  </span>
 
-                        <button
-                          type="button"
-                          onClick={() => seekBy(-10)}
-                          aria-label="Backward 10 seconds"
-                          className="tabbable p-2 rounded-full hover:bg-white/20 transition-transform duration-100 flex items-center active:scale-110"
-                        >
-                          <MovyBackward10Svg className="w-6 h-6" />
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => seekBy(10)}
-                          aria-label="Forward 10 seconds"
-                          className="tabbable p-2 rounded-full hover:bg-white/20 transition-transform duration-100 flex items-center active:scale-110"
-                        >
-                          <MovyForward10Svg className="w-6 h-6" />
-                        </button>
-
-                        {/* Hover-expanding Volume */}
-                        <div className="hidden md:flex items-center group">
-                          <button
-                            id="ButtonVolume"
-                            type="button"
-                            onClick={() => {
-                              setIsMuted((m) => !m);
-                              if (volume === 0) setVolume(100);
-                            }}
-                            aria-label={isMuted ? 'Unmute (m)' : 'Mute (m)'}
-                            className="tabbable p-2 rounded-full hover:bg-white/20 transition-transform duration-100 flex items-center active:scale-110"
-                          >
-                            <MovyVolumeSvg level={volume} muted={isMuted} className="w-6 h-6" />
-                          </button>
-
-                          <div className="relative flex items-center justify-start w-0 overflow-hidden transition-[width,opacity] duration-300 group-hover:w-20 opacity-0 group-hover:opacity-100">
-                            <div className="flex h-10 w-20 items-center px-2">
-                              <div className="relative h-1 flex-1 rounded-full bg-gray-500/50">
-                                <div
-                                  className="absolute inset-y-0 left-0 flex items-center justify-end rounded-full bg-white"
-                                  style={{ width: isMuted ? '0%' : `${volume}%` }}
-                                >
-                                  <div className="absolute h-3 w-3 translate-x-1/2 rounded-full bg-white pointer-events-none" />
-                                </div>
-                                <input
-                                  type="range"
-                                  aria-label="Volume"
-                                  min={0}
-                                  max={100}
-                                  value={isMuted ? 0 : volume}
-                                  onChange={(e) => {
-                                    const next = Number(e.target.value);
-                                    setVolume(next);
-                                    setIsMuted(next === 0);
-                                  }}
-                                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0"
-                                />
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-
-                        <span className="vp-controls-time text-xs md:text-sm font-medium text-white/85 tabular-nums pl-1">
-                          {formatClock(currentTime)} / {formatClock(duration)}
-                        </span>
-                      </>
-                    )}
-                  </div>
-
-                  {/* Right Controls */}
-                  <div className="flex flex-shrink-0 items-center space-x-1 md:space-x-2">
-                    <button
-                      type="button"
-                      onClick={() => onToggleWatchlist(detailItem)}
-                      aria-label={inWatchlist ? 'Remove from Watchlist' : 'Add to Watchlist'}
-                      className={`tabbable p-2 rounded-full hover:bg-white/20 transition ${
-                        inWatchlist ? 'text-[#ff4651]' : 'text-white/85 hover:text-white'
-                      }`}
-                    >
-                      {inWatchlist ? (
-                        <Check className="w-5 h-5" />
-                      ) : (
-                        <Bookmark className="w-5 h-5" />
-                      )}
-                    </button>
-
+                  {/* Mobile Fullscreen Button (Right of Progress Bar, ShaniStream-style) */}
+                  {isTouchDevice && (
                     <button
                       id="ButtonFullscreen"
                       type="button"
                       onClick={() => void toggleFullscreen()}
-                      aria-label={isFullscreen ? 'Exit full screen (f)' : 'Full screen (f)'}
-                      className="tabbable p-2 rounded-full hover:bg-white/20 transition-transform duration-100 flex items-center active:scale-110"
+                      aria-label={isFullscreen ? 'Exit full screen' : 'Full screen'}
+                      className="tabbable p-1.5 text-white/95 hover:text-white active:scale-95 transition flex-none"
                     >
                       {isFullscreen ? (
-                        <Minimize2 className="w-5 h-5 md:w-6 md:h-6" />
+                        <Minimize2 className="w-4 h-4 sm:w-5 sm:h-5" />
                       ) : (
-                        <Maximize2 className="w-5 h-5 md:w-6 md:h-6" />
+                        <Maximize2 className="w-4 h-4 sm:w-5 sm:h-5" />
                       )}
                     </button>
-                  </div>
+                  )}
                 </div>
+
+                {/* Controls Row */}
+                {isTouchDevice ? (
+                  /* Mobile Secondary Compact Pill Row: Watchlist & Download */
+                  <div className="mt-1.5 flex items-center justify-between gap-2">
+                    <div className={`${PILL_GROUP_CLASS} px-1.5 py-0.5 gap-0.5`}>
+                      <button
+                        type="button"
+                        onClick={() => onToggleWatchlist(detailItem)}
+                        aria-label={inWatchlist ? 'Remove from Watchlist' : 'Add to Watchlist'}
+                        className={`${PILL_ICON_BTN_CLASS} ${
+                          inWatchlist ? '!text-[#ff4651]' : ''
+                        }`}
+                      >
+                        {inWatchlist ? (
+                          <Check className="w-3.5 h-3.5" />
+                        ) : (
+                          <Bookmark className="w-3.5 h-3.5" />
+                        )}
+                        <span className="text-[11px]">{inWatchlist ? 'Saved' : 'Watchlist'}</span>
+                      </button>
+
+                      <div className="w-[1px] h-3.5 bg-white/20 mx-0.5" />
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onOpenDownload({
+                            item: detailItem,
+                            seasonNumber,
+                            episode: currentEpisode,
+                            animeAudio,
+                          })
+                        }
+                        aria-label="Download"
+                        className={PILL_ICON_BTN_CLASS}
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span className="text-[11px]">Download</span>
+                        {activeDownloads.length > 0 && (
+                          <span className="px-1.5 py-0.5 rounded-full bg-[#e50914] text-[10px] font-bold text-white tabular-nums">
+                            {overallProgress}%
+                          </span>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  /* Desktop Grouped Frosted Pills (ShaniStream Bottom Layout) */
+                  <div className="relative mt-2 md:mt-2.5 flex w-full items-center justify-between gap-3.5">
+                    {/* Left Pill: [Play/Pause | -10s | +10s | Next Ep? | Divider | Volume (Hover Slider)] */}
+                    <div className={`${PILL_GROUP_CLASS} px-2.5 py-1 hover:bg-white/[0.12] transition-colors`}>
+                      <button
+                        id="ButtonPlay"
+                        type="button"
+                        onClick={() => togglePlayPause()}
+                        aria-label={paused ? 'Play (k)' : 'Pause (k)'}
+                        className="tabbable p-1.5 rounded-xl border border-transparent hover:bg-white/10 text-white transition-all flex items-center active:scale-95"
+                      >
+                        <span className="text-xl flex items-center justify-center w-[1em] h-[1em]">
+                          {paused ? (
+                            <MovyPlaySvg className="w-[0.85em] h-[0.85em]" />
+                          ) : (
+                            <MovyPauseSvg className="w-[0.85em] h-[0.85em]" />
+                          )}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => seekBy(-10)}
+                        aria-label="Backward 10 seconds"
+                        className="tabbable p-1.5 rounded-xl border border-transparent hover:bg-white/10 text-white transition-all flex items-center active:scale-95"
+                      >
+                        <MovyBackward10Svg className="w-5 h-5" />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => seekBy(10)}
+                        aria-label="Forward 10 seconds"
+                        className="tabbable p-1.5 rounded-xl border border-transparent hover:bg-white/10 text-white transition-all flex items-center active:scale-95"
+                      >
+                        <MovyForward10Svg className="w-5 h-5" />
+                      </button>
+
+                      {nextEpisode && (
+                        <button
+                          type="button"
+                          onClick={() => setCurrentEpisode(nextEpisode)}
+                          aria-label="Next Episode"
+                          title="Next Episode"
+                          className="tabbable p-1.5 rounded-xl border border-transparent hover:bg-white/10 text-white transition-all flex items-center gap-1 active:scale-95 ml-0.5"
+                        >
+                          <SkipForward className="w-4 h-4" />
+                          <span className="hidden lg:inline text-xs font-semibold pr-0.5">
+                            Next Ep
+                          </span>
+                        </button>
+                      )}
+
+                      <div className="w-[1px] h-4 bg-white/20 mx-1.5" />
+
+                      {/* Hover-expanding Volume */}
+                      <div className="flex items-center group">
+                        <button
+                          id="ButtonVolume"
+                          type="button"
+                          onClick={() => {
+                            setIsMuted((m) => {
+                              const next = !m;
+                              triggerVolumeOsd(next ? 0 : volume, next);
+                              return next;
+                            });
+                            if (volume === 0) setVolume(100);
+                          }}
+                          aria-label={isMuted ? 'Unmute (m)' : 'Mute (m)'}
+                          className="tabbable p-1.5 rounded-xl border border-transparent hover:bg-white/10 text-white transition-all flex items-center active:scale-95"
+                        >
+                          <MovyVolumeSvg level={volume} muted={isMuted} className="w-5 h-5" />
+                        </button>
+
+                        <div className="relative flex items-center justify-start w-0 overflow-hidden transition-[width,opacity] duration-300 group-hover:w-28 opacity-0 group-hover:opacity-100">
+                          <div className="flex h-8 w-28 items-center gap-2 px-1.5">
+                            <div className="relative h-1 flex-1 rounded-full bg-white/25">
+                              <div
+                                className="absolute inset-y-0 left-0 flex items-center justify-end rounded-full bg-white"
+                                style={{ width: isMuted ? '0%' : `${volume}%` }}
+                              >
+                                <div className="absolute h-3 w-3 translate-x-1/2 rounded-full bg-white pointer-events-none" />
+                              </div>
+                              <input
+                                type="range"
+                                aria-label="Volume"
+                                min={0}
+                                max={100}
+                                value={isMuted ? 0 : volume}
+                                onChange={(e) => {
+                                  const next = Number(e.target.value);
+                                  setVolume(next);
+                                  setIsMuted(next === 0);
+                                }}
+                                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer m-0"
+                              />
+                            </div>
+                            <span className="text-[11px] font-bold text-white/90 tabular-nums min-w-[30px] text-right">
+                              {isMuted ? '0%' : `${volume}%`}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Right Pill: [Audio & Subtitles (CC) | Quality & Servers | Divider | Fullscreen] */}
+                    <div className={`${PILL_GROUP_CLASS} px-2.5 py-1 hover:bg-white/[0.12] transition-colors`}>
+                      {/* Audio & Subtitles Popover (Desktop Upward) */}
+                      <div
+                        ref={subsPopoverRef}
+                        className="relative"
+                        onPointerEnter={(e) => e.pointerType === 'mouse' && hoverMenuOpen('subs')}
+                        onPointerLeave={(e) => e.pointerType === 'mouse' && hoverMenuLeave()}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSubsView('main');
+                            setOpenMenu((m) => (m === 'subs' ? null : 'subs'));
+                          }}
+                          className={PILL_ICON_BTN_CLASS}
+                          aria-label="Audio and Subtitles (c)"
+                          title="Audio & Subtitles (c)"
+                        >
+                          <MovyCcSvg className="w-5 h-5 flex-shrink-0" />
+                          <span className="hidden xl:inline text-xs">Audio &amp; Subtitles</span>
+                        </button>
+
+                        {openMenu === 'subs' && (
+                          <div className="absolute right-0 bottom-full pb-3 z-50">
+                            {renderSubsPopoverPanel()}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Quality & Server Popover (Desktop Upward) */}
+                      <div
+                        ref={qualityPopoverRef}
+                        className="relative ml-0.5"
+                        onPointerEnter={(e) => e.pointerType === 'mouse' && hoverMenuOpen('quality')}
+                        onPointerLeave={(e) => e.pointerType === 'mouse' && hoverMenuLeave()}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setOpenMenu((m) => (m === 'quality' ? null : 'quality'))}
+                          className={PILL_ICON_BTN_CLASS}
+                          aria-label="Quality and Servers"
+                          title="Quality & Servers"
+                        >
+                          <MovyQualitySvg className="w-5 h-5 flex-shrink-0" />
+                          <span className="hidden xl:inline text-xs">Quality</span>
+                          {activeQualityText && (
+                            <span className="hidden lg:inline text-[11px] opacity-65 font-normal">
+                              {activeQualityText}
+                            </span>
+                          )}
+                        </button>
+
+                        {openMenu === 'quality' && (
+                          <div className="absolute right-0 bottom-full pb-3 z-50">
+                            {renderQualityPopoverPanel()}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="w-[1px] h-4 bg-white/20 mx-1.5" />
+
+                      <button
+                        id="ButtonFullscreen"
+                        type="button"
+                        onClick={() => void toggleFullscreen()}
+                        aria-label={isFullscreen ? 'Exit full screen (f)' : 'Full screen (f)'}
+                        title={isFullscreen ? 'Exit Fullscreen (f)' : 'Fullscreen (f)'}
+                        className="tabbable p-1.5 rounded-xl border border-transparent hover:bg-white/10 text-white transition-all flex items-center active:scale-95"
+                      >
+                        {isFullscreen ? (
+                          <Minimize2 className="w-5 h-5" />
+                        ) : (
+                          <Maximize2 className="w-5 h-5" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
